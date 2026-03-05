@@ -1,0 +1,15 @@
+pub const ProviderError = error{
+    AuthenticationFailed,
+    RateLimited,
+    InvalidRequest,
+    ModelNotFound,
+    ContextOverflow,
+    Overloaded,
+    ConnectionFailed,
+    Timeout,
+    InvalidResponse,
+    ProviderError,
+    OutOfMemory,
+    StreamInterrupted,
+    ContentFiltered,
+};
