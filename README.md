@@ -4,11 +4,11 @@ Talk to LLMs from Zig. No wrappers around C libraries, no pulling in half the in
 
 Inspired by [ruby_llm](https://github.com/crmne/ruby_llm)'s "make it dead simple" philosophy, but built for a language where you actually know who owns your memory.
 
-Ships with **Anthropic Claude** support. Adding new providers? Implement three functions and you're done.
+Ships with **Anthropic** and **OpenAI-compatible** providers out of the box. The OpenAI provider works with any service that implements the chat completions API — OpenAI, Groq, Together, Mistral, xAI, vLLM, Ollama, you name it. Adding new providers? Implement three functions and you're done.
 
 ## Why This Exists
 
-Every LLM library out there is either Python, JavaScript, or a Zig wrapper around a C/C++ binding. If you want to talk to Claude from Zig, you're hand-rolling HTTP requests and parsing JSON yourself. This library does that part so you can focus on the interesting stuff.
+Every LLM library out there is either Python, JavaScript, or a Zig wrapper around a C/C++ binding. If you want to talk to an LLM from Zig, you're hand-rolling HTTP requests and parsing JSON yourself. This library does that part so you can focus on the interesting stuff.
 
 ## Show Me the Code
 
@@ -46,6 +46,39 @@ pub fn main() !void {
 ```
 
 That's it. No boilerplate, no ceremony.
+
+### OpenAI / OpenAI-Compatible
+
+```zig
+const std = @import("std");
+const llm = @import("zig-llm");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const api_key = std.posix.getenv("OPENAI_API_KEY") orelse return;
+
+    // Point api_base at any OpenAI-compatible service
+    var openai = try llm.providers.OpenAI.init(allocator, .{
+        .api_key = api_key,
+        // .api_base = "https://api.groq.com/openai",  // Groq
+        // .api_base = "http://localhost:11434",         // Ollama
+    });
+    defer openai.deinit();
+
+    var chat = llm.Chat.init(allocator, openai.provider(), "gpt-4o-mini");
+    defer chat.deinit();
+
+    var response = try chat.send("Hello!");
+    defer response.deinit();
+
+    if (response.text()) |text| {
+        std.debug.print("{s}\n", .{text});
+    }
+}
+```
 
 ## Streaming
 
@@ -159,6 +192,10 @@ export ANTHROPIC_API_KEY="your-key-here"
 zig build run-basic_chat    # Simple conversation
 zig build run-streaming     # Watch tokens arrive in real time
 zig build run-tool_use      # Tool calling loop
+
+export OPENAI_API_KEY="your-key-here"
+
+zig build run-openai_chat   # OpenAI / OpenAI-compatible chat
 ```
 
 ## How It Works
@@ -199,7 +236,7 @@ No surprises here:
 ## Testing
 
 ```sh
-zig build test    # 30 tests, 0 leaks
+zig build test    # 46 tests, 0 leaks
 ```
 
 ## License

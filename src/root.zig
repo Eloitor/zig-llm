@@ -8,6 +8,7 @@ pub const json_helpers = @import("json_helpers.zig");
 
 pub const providers = struct {
     pub const Anthropic = @import("providers/anthropic.zig");
+    pub const OpenAI = @import("providers/openai.zig");
 };
 
 // Re-export commonly used types at top level
@@ -23,4 +24,6 @@ pub const ProviderError = errors.ProviderError;
 test {
     // Pull in all tests from submodules
     @import("std").testing.refAllDecls(@This());
+    // Explicitly pull in provider tests (refAllDecls doesn't recurse into nested structs)
+    @import("std").testing.refAllDecls(providers);
 }

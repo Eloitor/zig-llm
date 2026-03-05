@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "basic_chat", .src = "examples/basic_chat.zig" },
         .{ .name = "streaming", .src = "examples/streaming.zig" },
         .{ .name = "tool_use", .src = "examples/tool_use.zig" },
+        .{ .name = "openai_chat", .src = "examples/openai_chat.zig" },
     };
 
     for (examples) |example| {
