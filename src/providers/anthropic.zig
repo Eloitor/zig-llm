@@ -60,22 +60,20 @@ pub fn stream(self: *Anthropic, request: Provider.CompletionRequest, allocator: 
     const body = buildRequestBody(request, true, allocator) catch return error.OutOfMemory;
     defer allocator.free(body);
 
-    var resp = try doPost(self, body, allocator);
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ self.api_base, messages_path }) catch return error.OutOfMemory;
+    defer allocator.free(url);
 
-    if (http.mapStatusError(resp.status)) |err| {
-        resp.deinit();
-        return mapApiError(resp.body) orelse err;
-    }
+    const http_stream = try http.openStream(allocator, url, &.{
+        .{ .name = "x-api-key", .value = self.api_key },
+        .{ .name = "anthropic-version", .value = api_version },
+    }, body);
+    errdefer http_stream.deinit();
 
-    const ctx = allocator.create(StreamContext) catch {
-        resp.deinit();
-        return error.OutOfMemory;
-    };
+    const ctx = allocator.create(StreamContext) catch return error.OutOfMemory;
     ctx.* = .{
         .allocator = allocator,
-        .response_data = resp.body,
-        .response_allocator = resp.allocator,
-        .position = 0,
+        .http_stream = http_stream,
+        .sse_reader = sse.SseLineReader.init(http_stream.reader(), allocator),
         .done = false,
         .current_block_type = null,
         .current_tool_id = null,
@@ -389,17 +387,15 @@ const BlockType = enum { text, thinking, tool_use };
 
 const StreamContext = struct {
     allocator: Allocator,
-    response_data: []const u8,
-    response_allocator: Allocator,
-    position: usize,
+    http_stream: *http.HttpStream,
+    sse_reader: sse.SseLineReader,
     done: bool,
     current_block_type: ?BlockType,
     current_tool_id: ?[]const u8,
 
     pub fn next(self: *StreamContext) ProviderError!?types.StreamEvent {
         while (!self.done) {
-            const event = sse.nextEvent(self.response_data, self.position) orelse return null;
-            self.position = event.end_pos;
+            const event = (try self.sse_reader.nextEvent()) orelse return null;
 
             const event_type = event.event_type orelse continue;
 
@@ -510,7 +506,8 @@ const StreamContext = struct {
 
     pub fn deinit(self: *StreamContext) void {
         if (self.current_tool_id) |id| self.allocator.free(id);
-        self.response_allocator.free(self.response_data);
+        self.sse_reader.deinit();
+        self.http_stream.deinit();
         self.allocator.destroy(self);
     }
 };

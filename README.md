@@ -49,7 +49,7 @@ That's it. No boilerplate, no ceremony.
 
 ## Streaming
 
-Tokens come back as an iterator. You control the loop.
+True incremental streaming -- tokens arrive as the API generates them, not buffered. Under the hood, the library holds an open HTTP connection and parses SSE events off the wire one at a time. You get an iterator and control the loop.
 
 ```zig
 var iter = try chat.sendStreaming("Tell me a joke.");
@@ -205,8 +205,8 @@ src/
   Chat.zig              Multi-turn conversation manager
   types.zig             Message, Role, ContentBlock, TokenUsage, etc.
   errors.zig            ProviderError error set
-  sse.zig               Server-Sent Events parser
-  http.zig              HTTP POST wrapper
+  sse.zig               Server-Sent Events parser (buffer-based and streaming)
+  http.zig              HTTP client (buffered POST and streaming)
   json_helpers.zig      JSON building and parsing utilities
   providers/
     anthropic.zig       Anthropic Claude implementation
@@ -221,7 +221,7 @@ examples/
 ## Testing
 
 ```sh
-zig build test    # 22 tests, 0 leaks
+zig build test    # 30 tests, 0 leaks
 ```
 
 ## License

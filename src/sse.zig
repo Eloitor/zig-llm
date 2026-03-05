@@ -1,4 +1,6 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ProviderError = @import("errors.zig").ProviderError;
 
 pub const SseEvent = struct {
     event_type: ?[]const u8,
@@ -67,6 +69,110 @@ pub fn nextEvent(data: []const u8, position: usize) ?SseEvent {
     return null;
 }
 
+/// Incremental SSE parser that reads from a live stream (std.io.AnyReader).
+/// Reads one line at a time and assembles complete SSE events.
+/// The returned SseEvent data is valid until the next call to nextEvent().
+pub const SseLineReader = struct {
+    underlying: std.io.AnyReader,
+    line_buf: [8192]u8,
+    event_type_buf: [128]u8,
+    data_buf: std.ArrayList(u8),
+    event_type_len: usize,
+    has_event_type: bool,
+    has_data: bool,
+
+    pub fn init(reader: std.io.AnyReader, allocator: Allocator) SseLineReader {
+        return .{
+            .underlying = reader,
+            .line_buf = undefined,
+            .event_type_buf = undefined,
+            .data_buf = std.ArrayList(u8).init(allocator),
+            .event_type_len = 0,
+            .has_event_type = false,
+            .has_data = false,
+        };
+    }
+
+    pub fn deinit(self: *SseLineReader) void {
+        self.data_buf.deinit();
+    }
+
+    /// Read and return the next complete SSE event from the stream.
+    /// Returns null on EOF (connection closed). The returned SseEvent's
+    /// data slice is valid until the next call to nextEvent().
+    pub fn nextEvent(self: *SseLineReader) ProviderError!?SseEvent {
+        while (true) {
+            // Read one line (up to \n delimiter)
+            const line_with_newline = self.underlying.readUntilDelimiterOrEof(&self.line_buf, '\n') catch
+                return error.StreamInterrupted;
+
+            const raw_line = line_with_newline orelse {
+                // EOF — if we have accumulated data, return it as a final event
+                if (self.has_data) {
+                    return self.emitEvent();
+                }
+                return null;
+            };
+
+            // Strip trailing \r for \r\n line endings
+            const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+                raw_line[0 .. raw_line.len - 1]
+            else
+                raw_line;
+
+            // Empty line = event boundary
+            if (line.len == 0) {
+                if (self.has_data) {
+                    return self.emitEvent();
+                }
+                // Reset state and continue
+                self.resetEventState();
+                continue;
+            }
+
+            // Comment line — skip
+            if (line[0] == ':') continue;
+
+            // Parse field
+            if (std.mem.startsWith(u8, line, "event:")) {
+                const value = std.mem.trimLeft(u8, line["event:".len..], " ");
+                const copy_len = @min(value.len, self.event_type_buf.len);
+                @memcpy(self.event_type_buf[0..copy_len], value[0..copy_len]);
+                self.event_type_len = copy_len;
+                self.has_event_type = true;
+            } else if (std.mem.startsWith(u8, line, "data:")) {
+                const value_start = "data:".len + @as(usize, if (line.len > "data:".len and line["data:".len] == ' ') 1 else 0);
+                const value = line[value_start..];
+                // If we already have data, join with newline (SSE spec)
+                if (self.data_buf.items.len > 0) {
+                    self.data_buf.append('\n') catch return error.OutOfMemory;
+                }
+                self.data_buf.appendSlice(value) catch return error.OutOfMemory;
+                self.has_data = true;
+            }
+        }
+    }
+
+    fn emitEvent(self: *SseLineReader) SseEvent {
+        const event = SseEvent{
+            .event_type = if (self.has_event_type) self.event_type_buf[0..self.event_type_len] else null,
+            .data = self.data_buf.items,
+            .end_pos = 0,
+        };
+        // Don't clear data_buf here — the caller needs the slice to remain valid.
+        // Instead, we'll clear it at the start of the next accumulation.
+        self.resetEventState();
+        return event;
+    }
+
+    fn resetEventState(self: *SseLineReader) void {
+        self.has_event_type = false;
+        self.has_data = false;
+        self.event_type_len = 0;
+        self.data_buf.clearRetainingCapacity();
+    }
+};
+
 // --- Tests ---
 
 test "parse single SSE event" {
@@ -105,4 +211,81 @@ test "event without type" {
 test "incomplete event returns null" {
     const input = "event: partial\ndata: incomplete";
     try std.testing.expectEqual(@as(?SseEvent, null), nextEvent(input, 0));
+}
+
+// --- SseLineReader tests ---
+
+test "SseLineReader: single event" {
+    const input = "event: message_start\ndata: {\"type\":\"message\"}\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("message_start", event.event_type.?);
+    try std.testing.expectEqualStrings("{\"type\":\"message\"}", event.data);
+
+    // Next call should return null (EOF)
+    try std.testing.expect((try reader.nextEvent()) == null);
+}
+
+test "SseLineReader: multiple events" {
+    const input = "event: a\ndata: first\n\nevent: b\ndata: second\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const e1 = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("a", e1.event_type.?);
+    try std.testing.expectEqualStrings("first", e1.data);
+
+    const e2 = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("b", e2.event_type.?);
+    try std.testing.expectEqualStrings("second", e2.data);
+
+    try std.testing.expect((try reader.nextEvent()) == null);
+}
+
+test "SseLineReader: skip comments" {
+    const input = ": comment\nevent: ping\ndata: hello\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ping", event.event_type.?);
+    try std.testing.expectEqualStrings("hello", event.data);
+}
+
+test "SseLineReader: event without type" {
+    const input = "data: no-type\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(event.event_type == null);
+    try std.testing.expectEqualStrings("no-type", event.data);
+}
+
+test "SseLineReader: multiple data lines joined with newline" {
+    const input = "event: content\ndata: line1\ndata: line2\ndata: line3\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("content", event.event_type.?);
+    try std.testing.expectEqualStrings("line1\nline2\nline3", event.data);
+}
+
+test "SseLineReader: handles \\r\\n line endings" {
+    const input = "event: test\r\ndata: hello\r\n\r\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    defer reader.deinit();
+
+    const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("test", event.event_type.?);
+    try std.testing.expectEqualStrings("hello", event.data);
 }
