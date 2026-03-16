@@ -499,9 +499,16 @@ const StreamContext = struct {
     finish_reason: ?[]const u8,
     pending_usage: ?types.TokenUsage,
     pending_stop: bool,
+    pending_event: ?types.StreamEvent = null,
     current_tool_calls: std.ArrayList(PendingToolCall),
 
     pub fn next(self: *StreamContext) ProviderError!?types.StreamEvent {
+        // If we have a pending event buffered from the first chunk, return it now
+        if (self.pending_event) |evt| {
+            self.pending_event = null;
+            return evt;
+        }
+
         // If we have a pending stop event to emit after [DONE]
         if (self.pending_stop) {
             self.pending_stop = false;
@@ -546,6 +553,32 @@ const StreamContext = struct {
                     (if (jh.getJsonString(v)) |s| self.allocator.dupe(u8, s) catch return error.OutOfMemory else null)
                 else
                     null;
+
+                // Check if this first chunk also contains a content delta
+                if (jh.getPath(root, "choices.0.delta.content")) |content_val| {
+                    if (jh.getJsonString(content_val)) |text| {
+                        if (text.len > 0) {
+                            self.pending_event = .{ .text_delta = .{
+                                .text = self.allocator.dupe(u8, text) catch return error.OutOfMemory,
+                            } };
+                        }
+                    }
+                }
+
+                // Check if this first chunk also contains tool call deltas
+                if (self.pending_event == null) {
+                    if (jh.getPath(root, "choices.0.delta.tool_calls")) |tc_val| {
+                        if (jh.getJsonArray(tc_val)) |tc_arr| {
+                            for (tc_arr.items) |tc_item| {
+                                const maybe_event = try self.processToolCallDelta(tc_item);
+                                if (maybe_event) |evt| {
+                                    self.pending_event = evt;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 return .{ .message_start = .{ .message_id = msg_id, .model = model_val } };
             }
@@ -642,6 +675,11 @@ const StreamContext = struct {
     }
 
     pub fn deinit(self: *StreamContext) void {
+        if (self.pending_event) |evt| {
+            var e = evt;
+            e.deinit(self.allocator);
+            self.pending_event = null;
+        }
         if (self.finish_reason) |fr| self.allocator.free(fr);
         for (self.current_tool_calls.items) |tc| {
             if (tc.id) |id| self.allocator.free(id);
@@ -910,6 +948,214 @@ test "known models list" {
 
     try std.testing.expect(models.len > 0);
     try std.testing.expectEqualStrings("gpt-4o", models[0].id);
+}
+
+test "first chunk with content delta emits both message_start and text_delta" {
+    const allocator = std.testing.allocator;
+
+    // Simulate an OpenAI SSE stream where the first chunk contains both
+    // id/model AND a content delta, followed by a finish chunk and [DONE].
+    const sse_data =
+        "data: {\"id\":\"chatcmpl-abc\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n" ++
+        "\n" ++
+        "data: {\"id\":\"chatcmpl-abc\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fixed_stream = std.io.fixedBufferStream(sse_data);
+
+    // Create a StreamContext on the heap, but with http_stream undefined
+    // since we bypass it by providing our own sse_reader.
+    const ctx = allocator.create(StreamContext) catch unreachable;
+    ctx.* = .{
+        .allocator = allocator,
+        .http_stream = undefined, // We won't call http_stream methods
+        .sse_reader = sse.SseLineReader.init(fixed_stream.reader().any(), allocator),
+        .done = false,
+        .sent_start = false,
+        .finish_reason = null,
+        .pending_usage = null,
+        .pending_stop = false,
+        .current_tool_calls = std.ArrayList(PendingToolCall).init(allocator),
+    };
+    // Manual cleanup — we can't call ctx.deinit() because http_stream is undefined
+    defer {
+        if (ctx.pending_event) |evt| {
+            var e = evt;
+            e.deinit(allocator);
+        }
+        if (ctx.finish_reason) |fr| allocator.free(fr);
+        for (ctx.current_tool_calls.items) |tc| {
+            if (tc.id) |id| allocator.free(id);
+            if (tc.name) |name| allocator.free(name);
+        }
+        ctx.current_tool_calls.deinit();
+        ctx.sse_reader.deinit();
+        allocator.destroy(ctx);
+    }
+
+    // Event 1: should be message_start
+    const evt1 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt1;
+        e.deinit(allocator);
+    }
+    switch (evt1) {
+        .message_start => |ms| {
+            try std.testing.expectEqualStrings("chatcmpl-abc", ms.message_id.?);
+            try std.testing.expectEqualStrings("gpt-4o", ms.model.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 2: should be text_delta with "Hello" (buffered from first chunk)
+    const evt2 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt2;
+        e.deinit(allocator);
+    }
+    switch (evt2) {
+        .text_delta => |td| {
+            try std.testing.expectEqualStrings("Hello", td.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 3: should be message_delta with stop_reason
+    const evt3 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt3;
+        e.deinit(allocator);
+    }
+    switch (evt3) {
+        .message_delta => |md| {
+            try std.testing.expectEqualStrings("end_turn", md.stop_reason.?);
+            try std.testing.expectEqual(@as(u32, 5), md.usage.?.input_tokens);
+            try std.testing.expectEqual(@as(u32, 1), md.usage.?.output_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 4: should be message_stop
+    const evt4 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    switch (evt4) {
+        .message_stop => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // No more events
+    const evt5 = try ctx.next();
+    try std.testing.expect(evt5 == null);
+}
+
+test "first chunk with tool call delta emits message_start then tool_use_start" {
+    const allocator = std.testing.allocator;
+
+    // First chunk contains id/model AND a tool_calls delta with id+name
+    const sse_data =
+        "data: {\"id\":\"chatcmpl-xyz\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n" ++
+        "\n" ++
+        "data: {\"id\":\"chatcmpl-xyz\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"London\\\"}\"}}]}}]}\n" ++
+        "\n" ++
+        "data: {\"id\":\"chatcmpl-xyz\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8}}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    var fixed_stream = std.io.fixedBufferStream(sse_data);
+
+    const ctx = allocator.create(StreamContext) catch unreachable;
+    ctx.* = .{
+        .allocator = allocator,
+        .http_stream = undefined,
+        .sse_reader = sse.SseLineReader.init(fixed_stream.reader().any(), allocator),
+        .done = false,
+        .sent_start = false,
+        .finish_reason = null,
+        .pending_usage = null,
+        .pending_stop = false,
+        .current_tool_calls = std.ArrayList(PendingToolCall).init(allocator),
+    };
+    defer {
+        if (ctx.pending_event) |evt| {
+            var e = evt;
+            e.deinit(allocator);
+        }
+        if (ctx.finish_reason) |fr| allocator.free(fr);
+        for (ctx.current_tool_calls.items) |tc| {
+            if (tc.id) |id| allocator.free(id);
+            if (tc.name) |name| allocator.free(name);
+        }
+        ctx.current_tool_calls.deinit();
+        ctx.sse_reader.deinit();
+        allocator.destroy(ctx);
+    }
+
+    // Event 1: message_start
+    const evt1 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt1;
+        e.deinit(allocator);
+    }
+    switch (evt1) {
+        .message_start => |ms| {
+            try std.testing.expectEqualStrings("chatcmpl-xyz", ms.message_id.?);
+            try std.testing.expectEqualStrings("gpt-4o", ms.model.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 2: tool_use_start (buffered from first chunk)
+    const evt2 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt2;
+        e.deinit(allocator);
+    }
+    switch (evt2) {
+        .tool_use_start => |ts| {
+            try std.testing.expectEqualStrings("call_1", ts.id);
+            try std.testing.expectEqualStrings("get_weather", ts.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 3: tool_input_delta with the arguments
+    const evt3 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt3;
+        e.deinit(allocator);
+    }
+    switch (evt3) {
+        .tool_input_delta => |tid| {
+            try std.testing.expectEqualStrings("{\"city\":\"London\"}", tid.json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 4: message_delta with stop_reason
+    const evt4 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    defer {
+        var e = evt4;
+        e.deinit(allocator);
+    }
+    switch (evt4) {
+        .message_delta => |md| {
+            try std.testing.expectEqualStrings("tool_use", md.stop_reason.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Event 5: message_stop
+    const evt5 = (try ctx.next()) orelse return error.TestUnexpectedResult;
+    switch (evt5) {
+        .message_stop => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // No more events
+    const evt6 = try ctx.next();
+    try std.testing.expect(evt6 == null);
 }
 
 test "stop sequences use stop field" {
