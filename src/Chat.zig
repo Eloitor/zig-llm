@@ -61,16 +61,160 @@ pub fn send(self: *Chat, text: []const u8) ProviderError!Provider.CompletionResp
     return response;
 }
 
-/// Send a text message and get a streaming iterator.
-/// The user message is added to history. Caller must call appendAssistantMessage()
-/// after consuming the stream to add the response to history.
-pub fn sendStreaming(self: *Chat, text: []const u8) ProviderError!Provider.StreamIterator {
+/// Send a text message and get a managed streaming response.
+/// The user message is added to history. The assistant response is automatically
+/// appended to history when the stream is fully consumed (on `message_stop`),
+/// or when the `StreamResponse` is deinitialized.
+pub fn sendStreaming(self: *Chat, text: []const u8) ProviderError!StreamResponse {
     try self.appendUserMessage(text);
     errdefer _ = self.history.pop();
 
     const request = self.buildRequest();
-    return self.streamWithRetry(request);
+    const iterator = try self.streamWithRetry(request);
+
+    return StreamResponse.init(self, iterator, self.allocator);
 }
+
+/// A managed streaming response that wraps a `StreamIterator` and automatically
+/// accumulates content, then appends the assistant message to chat history when done.
+pub const StreamResponse = struct {
+    chat: *Chat,
+    iterator: Provider.StreamIterator,
+    allocator: Allocator,
+    // Accumulation state
+    text_buf: std.ArrayList(u8),
+    tool_calls: std.ArrayList(AccumulatedToolCall),
+    finished: bool,
+    usage: types.TokenUsage,
+    stop_reason: types.StopReason,
+
+    pub const AccumulatedToolCall = struct {
+        id: []const u8,
+        name: []const u8,
+        input_buf: std.ArrayList(u8),
+
+        pub fn deinit(self: *AccumulatedToolCall, allocator: Allocator) void {
+            allocator.free(self.id);
+            allocator.free(self.name);
+            self.input_buf.deinit();
+        }
+    };
+
+    pub fn init(chat: *Chat, iterator: Provider.StreamIterator, allocator: Allocator) StreamResponse {
+        return .{
+            .chat = chat,
+            .iterator = iterator,
+            .allocator = allocator,
+            .text_buf = std.ArrayList(u8).init(allocator),
+            .tool_calls = std.ArrayList(AccumulatedToolCall).init(allocator),
+            .finished = false,
+            .usage = .{},
+            .stop_reason = .unknown,
+        };
+    }
+
+    /// Get the next stream event. Also accumulates content internally.
+    /// The caller should still call `event.deinit(allocator)` on each returned event.
+    pub fn next(self: *StreamResponse) ProviderError!?types.StreamEvent {
+        const event = (try self.iterator.next()) orelse return null;
+
+        // Accumulate based on event type
+        switch (event) {
+            .text_delta => |td| {
+                self.text_buf.appendSlice(td.text) catch {};
+            },
+            .tool_use_start => |tu| {
+                self.tool_calls.append(.{
+                    .id = self.allocator.dupe(u8, tu.id) catch return error.OutOfMemory,
+                    .name = self.allocator.dupe(u8, tu.name) catch return error.OutOfMemory,
+                    .input_buf = std.ArrayList(u8).init(self.allocator),
+                }) catch return error.OutOfMemory;
+            },
+            .tool_input_delta => |tid| {
+                if (self.tool_calls.items.len > 0) {
+                    var last = &self.tool_calls.items[self.tool_calls.items.len - 1];
+                    last.input_buf.appendSlice(tid.json) catch {};
+                }
+            },
+            .message_delta => |md| {
+                if (md.usage) |u| self.usage = u;
+                if (md.stop_reason) |sr| self.stop_reason = types.StopReason.fromString(sr);
+            },
+            .message_stop => {
+                if (!self.finished) {
+                    self.finished = true;
+                    self.finalizeHistory() catch {};
+                }
+            },
+            else => {},
+        }
+
+        return event;
+    }
+
+    fn finalizeHistory(self: *StreamResponse) !void {
+        // Count how many content blocks we need
+        const text_count: usize = if (self.text_buf.items.len > 0) 1 else 0;
+        const total_blocks = text_count + self.tool_calls.items.len;
+
+        if (total_blocks == 0) return;
+
+        var content = self.allocator.alloc(types.ContentBlock, total_blocks) catch return;
+        errdefer self.allocator.free(content);
+
+        var idx: usize = 0;
+
+        // Add text block if we accumulated any text
+        if (self.text_buf.items.len > 0) {
+            content[idx] = .{ .text = .{
+                .text = self.allocator.dupe(u8, self.text_buf.items) catch return,
+            } };
+            idx += 1;
+        }
+
+        // Add tool_use blocks
+        for (self.tool_calls.items) |tc| {
+            content[idx] = .{ .tool_use = .{
+                .id = self.allocator.dupe(u8, tc.id) catch return,
+                .name = self.allocator.dupe(u8, tc.name) catch return,
+                .input_json = self.allocator.dupe(u8, tc.input_buf.items) catch return,
+            } };
+            idx += 1;
+        }
+
+        // Update usage on the chat
+        self.chat.total_usage = self.chat.total_usage.add(self.usage);
+
+        // Append assistant message to history
+        self.chat.history.append(.{
+            .role = .assistant,
+            .content = content,
+            .allocator = self.allocator,
+        }) catch return;
+    }
+
+    pub fn deinit(self: *StreamResponse) void {
+        // If stream wasn't fully consumed, still try to finalize
+        if (!self.finished) {
+            // Drain remaining events to finalize
+            while (self.next() catch null) |event| {
+                const is_stop = std.meta.activeTag(event) == .message_stop;
+                event.deinit(self.allocator);
+                if (is_stop) break;
+            }
+        }
+
+        // Clean up accumulated state
+        self.text_buf.deinit();
+        for (self.tool_calls.items) |*tc| {
+            tc.deinit(self.allocator);
+        }
+        self.tool_calls.deinit();
+
+        // Clean up the underlying iterator
+        self.iterator.deinit();
+    }
+};
 
 /// The result of a tool invocation, returned by the handler passed to sendWithTools.
 pub const ToolResult = struct {
@@ -535,4 +679,89 @@ test "Chat tracks cumulative usage" {
 
     try std.testing.expectEqual(@as(u32, 20), chat.total_usage.input_tokens);
     try std.testing.expectEqual(@as(u32, 10), chat.total_usage.output_tokens);
+}
+
+test "StreamResponse automatically appends history after stream completes" {
+    const allocator = std.testing.allocator;
+
+    var mp = try mock.MockProvider.init(allocator);
+    defer mp.deinit();
+
+    var chat = Chat.init(allocator, mp.provider(), "test-model");
+    defer chat.deinit();
+
+    // sendStreaming returns a StreamResponse
+    var stream = try chat.sendStreaming("Hello streaming!");
+    defer stream.deinit();
+
+    // At this point, only the user message is in history
+    try std.testing.expectEqual(@as(usize, 1), chat.history.items.len);
+    try std.testing.expectEqual(types.Role.user, chat.history.items[0].role);
+
+    // Consume the stream fully
+    var full_text = std.ArrayList(u8).init(allocator);
+    defer full_text.deinit();
+
+    while (try stream.next()) |event| {
+        switch (event) {
+            .text_delta => |td| {
+                try full_text.appendSlice(td.text);
+                event.deinit(allocator);
+            },
+            .message_stop => {
+                // message_stop doesn't need deinit, but check history was updated
+                break;
+            },
+            else => event.deinit(allocator),
+        }
+    }
+
+    // The streamed text should match
+    try std.testing.expectEqualStrings("This is a mock response.", full_text.items);
+
+    // History should now have both user and assistant messages
+    try std.testing.expectEqual(@as(usize, 2), chat.history.items.len);
+    try std.testing.expectEqual(types.Role.user, chat.history.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, chat.history.items[1].role);
+
+    // The assistant message text in history should match
+    try std.testing.expectEqualStrings(
+        "This is a mock response.",
+        chat.history.items[1].text().?,
+    );
+
+    // Usage should be tracked
+    try std.testing.expectEqual(@as(u32, 10), chat.total_usage.input_tokens);
+    try std.testing.expectEqual(@as(u32, 5), chat.total_usage.output_tokens);
+
+    // Stop reason should be captured
+    try std.testing.expectEqual(types.StopReason.end_turn, stream.stop_reason);
+}
+
+test "StreamResponse deinit finalizes if stream not fully consumed" {
+    const allocator = std.testing.allocator;
+
+    var mp = try mock.MockProvider.init(allocator);
+    defer mp.deinit();
+
+    var chat = Chat.init(allocator, mp.provider(), "test-model");
+    defer chat.deinit();
+
+    {
+        var stream = try chat.sendStreaming("Hello!");
+        // Read only the first event (message_start), then let deinit handle the rest
+        const event = (try stream.next()).?;
+        event.deinit(allocator);
+        // deinit drains remaining events and finalizes history
+        stream.deinit();
+    }
+
+    // History should have both user and assistant messages
+    try std.testing.expectEqual(@as(usize, 2), chat.history.items.len);
+    try std.testing.expectEqual(types.Role.user, chat.history.items[0].role);
+    try std.testing.expectEqual(types.Role.assistant, chat.history.items[1].role);
+    try std.testing.expectEqualStrings(
+        "This is a mock response.",
+        chat.history.items[1].text().?,
+    );
 }
