@@ -125,6 +125,16 @@ fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, alloca
         try jw.valueFloat(@floatCast(temp));
     }
 
+    if (request.top_p) |top_p| {
+        try jw.field("top_p");
+        try jw.valueFloat(@floatCast(top_p));
+    }
+
+    if (request.top_k) |top_k| {
+        try jw.field("top_k");
+        try jw.valueInt(@intCast(top_k));
+    }
+
     if (request.system_prompt) |sys| {
         try jw.field("system");
         try jw.valueString(sys);
@@ -682,4 +692,26 @@ test "known models list" {
 
     try std.testing.expect(models.len > 0);
     try std.testing.expectEqualStrings("claude-opus-4-20250514", models[0].id);
+}
+
+test "buildRequestBody with sampling params" {
+    const allocator = std.testing.allocator;
+    const msgs = try allocator.alloc(types.Message, 0);
+    defer allocator.free(msgs);
+
+    const body = try buildRequestBody(.{
+        .model = "claude-sonnet-4-20250514",
+        .messages = msgs,
+        .top_p = 0.9,
+        .top_k = 40,
+        .temperature = 0.7,
+    }, false, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(jh.getPath(parsed.value, "top_p") != null);
+    try std.testing.expect(jh.getPath(parsed.value, "top_k") != null);
+    try std.testing.expect(jh.getPath(parsed.value, "temperature") != null);
 }

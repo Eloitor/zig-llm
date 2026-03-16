@@ -13,6 +13,10 @@ system_prompt: ?[]const u8 = null,
 tools: []const types.ToolDefinition = &.{},
 max_tokens: u32 = 4096,
 temperature: ?f32 = null,
+top_p: ?f32 = null,
+top_k: ?u32 = null,
+frequency_penalty: ?f32 = null,
+presence_penalty: ?f32 = null,
 history: std.ArrayList(types.Message),
 total_usage: types.TokenUsage = .{},
 
@@ -226,6 +230,10 @@ fn buildRequest(self: *Chat) Provider.CompletionRequest {
         .tools = self.tools,
         .max_tokens = self.max_tokens,
         .temperature = self.temperature,
+        .top_p = self.top_p,
+        .top_k = self.top_k,
+        .frequency_penalty = self.frequency_penalty,
+        .presence_penalty = self.presence_penalty,
     };
 }
 

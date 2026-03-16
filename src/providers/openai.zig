@@ -136,6 +136,21 @@ fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, alloca
         try jw.valueFloat(@floatCast(temp));
     }
 
+    if (request.top_p) |top_p| {
+        try jw.field("top_p");
+        try jw.valueFloat(@floatCast(top_p));
+    }
+
+    if (request.frequency_penalty) |fp| {
+        try jw.field("frequency_penalty");
+        try jw.valueFloat(@floatCast(fp));
+    }
+
+    if (request.presence_penalty) |pp| {
+        try jw.field("presence_penalty");
+        try jw.valueFloat(@floatCast(pp));
+    }
+
     if (request.stop_sequences.len > 0) {
         try jw.field("stop");
         try jw.beginArray();
@@ -935,4 +950,26 @@ test "stop sequences use stop field" {
 
     const first_stop = jh.getJsonString(jh.getPath(parsed.value, "stop.0").?).?;
     try std.testing.expectEqualStrings("END", first_stop);
+}
+
+test "buildRequestBody with sampling params" {
+    const allocator = std.testing.allocator;
+    const msgs = try allocator.alloc(types.Message, 0);
+    defer allocator.free(msgs);
+
+    const body = try buildRequestBody(.{
+        .model = "gpt-4o",
+        .messages = msgs,
+        .top_p = 0.9,
+        .frequency_penalty = 0.5,
+        .presence_penalty = 0.3,
+    }, false, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(jh.getPath(parsed.value, "top_p") != null);
+    try std.testing.expect(jh.getPath(parsed.value, "frequency_penalty") != null);
+    try std.testing.expect(jh.getPath(parsed.value, "presence_penalty") != null);
 }
