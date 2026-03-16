@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Provider = @import("Provider.zig");
 const types = @import("types.zig");
 const ProviderError = @import("errors.zig").ProviderError;
+const retry = @import("retry.zig");
 
 const Chat = @This();
 
@@ -17,6 +18,7 @@ top_p: ?f32 = null,
 top_k: ?u32 = null,
 frequency_penalty: ?f32 = null,
 presence_penalty: ?f32 = null,
+retry_config: ?retry.RetryConfig = null,
 history: std.ArrayList(types.Message),
 total_usage: types.TokenUsage = .{},
 
@@ -46,8 +48,8 @@ pub fn send(self: *Chat, text: []const u8) ProviderError!Provider.CompletionResp
     // Build request
     const request = self.buildRequest();
 
-    // Get completion
-    const response = try self.provider.complete(request, self.allocator);
+    // Get completion (with retry if configured)
+    const response = try self.completeWithRetry(request);
 
     // Track usage
     self.total_usage = self.total_usage.add(response.usage);
@@ -67,7 +69,7 @@ pub fn sendStreaming(self: *Chat, text: []const u8) ProviderError!Provider.Strea
     errdefer _ = self.history.pop();
 
     const request = self.buildRequest();
-    return self.provider.stream(request, self.allocator);
+    return self.streamWithRetry(request);
 }
 
 /// The result of a tool invocation, returned by the handler passed to sendWithTools.
@@ -197,7 +199,7 @@ pub fn sendToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8,
 
     const request = self.buildRequest();
 
-    const response = try self.provider.complete(request, self.allocator);
+    const response = try self.completeWithRetry(request);
     self.total_usage = self.total_usage.add(response.usage);
 
     const history_msg = cloneMessage(response.message, self.allocator) catch return error.OutOfMemory;
@@ -266,11 +268,57 @@ fn appendToolCallResults(self: *Chat, calls: []const PendingToolCall) ProviderEr
 /// Complete against current history and record the assistant response.
 fn completeAndRecord(self: *Chat) ProviderError!Provider.CompletionResponse {
     const request = self.buildRequest();
-    const response = try self.provider.complete(request, self.allocator);
+    const response = try self.completeWithRetry(request);
     self.total_usage = self.total_usage.add(response.usage);
     const history_msg = cloneMessage(response.message, self.allocator) catch return error.OutOfMemory;
     self.history.append(history_msg) catch return error.OutOfMemory;
     return response;
+}
+
+/// Execute a completion request with retry logic for transient errors.
+fn completeWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderError!Provider.CompletionResponse {
+    const retry_cfg = self.retry_config orelse return self.provider.complete(request, self.allocator);
+
+    var attempt: u32 = 0;
+    var delay_ms: u64 = retry_cfg.initial_delay_ms;
+
+    while (true) {
+        const result = self.provider.complete(request, self.allocator);
+        if (result) |response| {
+            return response;
+        } else |err| {
+            if (!retry.isRetryable(err) or attempt >= retry_cfg.max_retries) {
+                return err;
+            }
+            attempt += 1;
+            std.time.sleep(delay_ms * std.time.ns_per_ms);
+            delay_ms = @min(delay_ms * retry_cfg.backoff_multiplier, retry_cfg.max_delay_ms);
+        }
+    }
+}
+
+/// Execute a streaming request with retry logic for transient errors.
+/// Note: only the initial connection is retried. Once streaming begins,
+/// errors during iteration are not retried at this level.
+fn streamWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderError!Provider.StreamIterator {
+    const retry_cfg = self.retry_config orelse return self.provider.stream(request, self.allocator);
+
+    var attempt: u32 = 0;
+    var delay_ms: u64 = retry_cfg.initial_delay_ms;
+
+    while (true) {
+        const result = self.provider.stream(request, self.allocator);
+        if (result) |iter| {
+            return iter;
+        } else |err| {
+            if (!retry.isRetryable(err) or attempt >= retry_cfg.max_retries) {
+                return err;
+            }
+            attempt += 1;
+            std.time.sleep(delay_ms * std.time.ns_per_ms);
+            delay_ms = @min(delay_ms * retry_cfg.backoff_multiplier, retry_cfg.max_delay_ms);
+        }
+    }
 }
 
 fn appendToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8, is_error: bool) ProviderError!void {
@@ -447,6 +495,28 @@ test "Chat sendWithTools runs parallel tool calls" {
     try std.testing.expectEqual(@as(usize, 4), chat.history.items.len);
     // The tool_result message should have 3 content blocks
     try std.testing.expectEqual(@as(usize, 3), chat.history.items[2].content.len);
+}
+
+test "Chat retry config" {
+    const allocator = std.testing.allocator;
+
+    var mp = try mock.MockProvider.init(allocator);
+    defer mp.deinit();
+
+    var chat = Chat.init(allocator, mp.provider(), "test-model");
+    defer chat.deinit();
+
+    // Retry is off by default
+    try std.testing.expect(chat.retry_config == null);
+
+    // Can be enabled
+    chat.retry_config = .{ .max_retries = 5 };
+    try std.testing.expectEqual(@as(u32, 5), chat.retry_config.?.max_retries);
+
+    // Other fields have defaults
+    try std.testing.expectEqual(@as(u64, 1000), chat.retry_config.?.initial_delay_ms);
+    try std.testing.expectEqual(@as(u64, 30000), chat.retry_config.?.max_delay_ms);
+    try std.testing.expectEqual(@as(u32, 2), chat.retry_config.?.backoff_multiplier);
 }
 
 test "Chat tracks cumulative usage" {
