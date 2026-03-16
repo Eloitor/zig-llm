@@ -6,15 +6,16 @@ pub fn JsonWriter(comptime Writer: type) type {
     return struct {
         writer: Writer,
         depth: usize,
-        needs_comma: [64]bool,
+        needs_comma: [max_depth]bool,
 
         const Self = @This();
+        const max_depth = 256;
 
         pub fn init(writer: Writer) Self {
             return .{
                 .writer = writer,
                 .depth = 0,
-                .needs_comma = [_]bool{false} ** 64,
+                .needs_comma = [_]bool{false} ** max_depth,
             };
         }
 
@@ -28,6 +29,7 @@ pub fn JsonWriter(comptime Writer: type) type {
         }
 
         pub fn beginObject(self: *Self) !void {
+            if (self.depth + 1 >= max_depth) return error.Overflow;
             try self.writeCommaIfNeeded();
             try self.writer.writeByte('{');
             self.depth += 1;
@@ -40,6 +42,7 @@ pub fn JsonWriter(comptime Writer: type) type {
         }
 
         pub fn beginArray(self: *Self) !void {
+            if (self.depth + 1 >= max_depth) return error.Overflow;
             try self.writeCommaIfNeeded();
             try self.writer.writeByte('[');
             self.depth += 1;
@@ -236,4 +239,40 @@ test "getPath navigation" {
 
     const val = getPath(parsed.value, "a.b.1") orelse unreachable;
     try std.testing.expectEqual(@as(i64, 2), val.integer);
+}
+
+test "JsonWriter handles deep nesting" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    var jw = jsonWriter(buf.writer());
+
+    // Nest to a reasonable depth
+    for (0..100) |_| {
+        try jw.beginObject();
+        try jw.field("nested");
+    }
+    try jw.valueNull();
+    for (0..100) |_| {
+        try jw.endObject();
+    }
+}
+
+test "JsonWriter rejects excessive depth" {
+    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    defer buf.deinit();
+
+    var jw = jsonWriter(buf.writer());
+
+    // Try to exceed max depth
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        jw.beginObject() catch |err| {
+            try std.testing.expectEqual(error.Overflow, err);
+            return; // Test passes
+        };
+        jw.field("x") catch return;
+    }
+    // Should not reach here
+    return error.TestUnexpectedResult;
 }
