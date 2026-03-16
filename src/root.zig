@@ -2,6 +2,7 @@ pub const Provider = @import("Provider.zig");
 pub const Chat = @import("Chat.zig");
 pub const types = @import("types.zig");
 pub const errors = @import("errors.zig");
+pub const retry = @import("retry.zig");
 pub const sse = @import("sse.zig");
 pub const http = @import("http.zig");
 pub const json_helpers = @import("json_helpers.zig");
@@ -20,6 +21,7 @@ pub const TokenUsage = types.TokenUsage;
 pub const ToolDefinition = types.ToolDefinition;
 pub const StopReason = types.StopReason;
 pub const ProviderError = errors.ProviderError;
+pub const RetryConfig = retry.RetryConfig;
 
 test {
     // Pull in all tests from submodules
