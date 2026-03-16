@@ -94,6 +94,7 @@ pub const MockProvider = struct {
             .response_text = self.response_text,
             .position = 0,
             .sent_start = false,
+            .sent_delta = false,
             .sent_stop = false,
         };
 
@@ -120,6 +121,7 @@ const MockStreamContext = struct {
     response_text: []const u8,
     position: usize,
     sent_start: bool,
+    sent_delta: bool,
     sent_stop: bool,
 
     pub fn next(self: *MockStreamContext) ProviderError!?types.StreamEvent {
@@ -135,6 +137,15 @@ const MockStreamContext = struct {
             self.position = end;
             return .{ .text_delta = .{
                 .text = self.allocator.dupe(u8, chunk) catch return error.OutOfMemory,
+            } };
+        }
+
+        // Send message_delta with stop_reason and usage before message_stop
+        if (!self.sent_delta) {
+            self.sent_delta = true;
+            return .{ .message_delta = .{
+                .stop_reason = self.allocator.dupe(u8, "end_turn") catch return error.OutOfMemory,
+                .usage = .{ .input_tokens = 10, .output_tokens = 5 },
             } };
         }
 
@@ -199,7 +210,9 @@ test "MockProvider stream" {
                 event.deinit(allocator);
             },
             .message_stop => break,
-            else => event.deinit(allocator),
+            else => {
+                event.deinit(allocator);
+            },
         }
     }
 
