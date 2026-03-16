@@ -2,7 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Provider = @import("../Provider.zig");
 const types = @import("../types.zig");
-const ProviderError = @import("../errors.zig").ProviderError;
+const errors = @import("../errors.zig");
+const ProviderError = errors.ProviderError;
 const http = @import("../http.zig");
 const sse = @import("../sse.zig");
 const jh = @import("../json_helpers.zig");
@@ -12,6 +13,7 @@ const Anthropic = @This();
 allocator: Allocator,
 api_key: []const u8,
 api_base: []const u8,
+last_error: ?errors.ErrorDetails = null,
 
 pub const Config = struct {
     api_key: []const u8,
@@ -33,7 +35,26 @@ pub fn init(allocator: Allocator, config: Config) ProviderError!*Anthropic {
 }
 
 pub fn deinit(self: *Anthropic) void {
+    self.clearLastError();
     self.allocator.destroy(self);
+}
+
+pub fn lastError(self: *const Anthropic) ?[]const u8 {
+    if (self.last_error) |details| {
+        return details.message;
+    }
+    return null;
+}
+
+pub fn lastErrorDetails(self: *const Anthropic) ?errors.ErrorDetails {
+    return self.last_error;
+}
+
+fn clearLastError(self: *Anthropic) void {
+    if (self.last_error) |*details| {
+        details.deinit();
+        self.last_error = null;
+    }
 }
 
 pub fn provider(self: *Anthropic) Provider {
@@ -43,6 +64,8 @@ pub fn provider(self: *Anthropic) Provider {
 // --- Provider interface implementation ---
 
 pub fn complete(self: *Anthropic, request: Provider.CompletionRequest, allocator: Allocator) ProviderError!Provider.CompletionResponse {
+    self.clearLastError();
+
     const body = buildRequestBody(request, false, allocator) catch return error.OutOfMemory;
     defer allocator.free(body);
 
@@ -50,13 +73,15 @@ pub fn complete(self: *Anthropic, request: Provider.CompletionRequest, allocator
     defer resp.deinit();
 
     if (http.mapStatusError(resp.status)) |err| {
-        return mapApiError(resp.body) orelse err;
+        return self.mapApiError(resp.body) orelse err;
     }
 
-    return parseCompletionResponse(resp.body, allocator);
+    return self.parseCompletionResponseWithErrorCapture(resp.body, allocator);
 }
 
 pub fn stream(self: *Anthropic, request: Provider.CompletionRequest, allocator: Allocator) ProviderError!Provider.StreamIterator {
+    self.clearLastError();
+
     const body = buildRequestBody(request, true, allocator) catch return error.OutOfMemory;
     defer allocator.free(body);
 
@@ -273,9 +298,13 @@ fn parseCompletionResponse(body: []const u8, allocator: Allocator) ProviderError
 
     // Check for API error in response body
     if (jh.getPath(root, "error.type")) |_| {
-        return mapApiErrorFromJson(root) orelse error.ProviderError;
+        return classifyApiError(root) orelse error.ProviderError;
     }
 
+    return parseCompletionFromParsedJson(root, allocator);
+}
+
+fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) ProviderError!Provider.CompletionResponse {
     const model_str = jh.getJsonString(jh.getPath(root, "model") orelse return error.InvalidResponse) orelse return error.InvalidResponse;
     const model = allocator.dupe(u8, model_str) catch return error.OutOfMemory;
     errdefer allocator.free(model);
@@ -362,13 +391,29 @@ fn intToU32(v: ?i64) u32 {
 
 // --- Error mapping ---
 
-fn mapApiError(body: []const u8) ?ProviderError {
+fn mapApiError(self: *Anthropic, body: []const u8) ?ProviderError {
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return null;
     defer parsed.deinit();
-    return mapApiErrorFromJson(parsed.value);
+    return self.mapApiErrorFromJson(parsed.value);
 }
 
-fn mapApiErrorFromJson(root: std.json.Value) ?ProviderError {
+fn mapApiErrorFromJson(self: *Anthropic, root: std.json.Value) ?ProviderError {
+    const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse return null) orelse return null;
+    const err_message = if (jh.getPath(root, "error.message")) |msg_val| (jh.getJsonString(msg_val) orelse "unknown error") else "unknown error";
+
+    self.storeErrorDetails(err_type, err_message);
+
+    if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
+    if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
+    if (std.mem.eql(u8, err_type, "invalid_request_error")) return error.InvalidRequest;
+    if (std.mem.eql(u8, err_type, "overloaded_error")) return error.Overloaded;
+    if (std.mem.eql(u8, err_type, "not_found_error")) return error.ModelNotFound;
+    if (std.mem.eql(u8, err_type, "permission_error")) return error.AuthenticationFailed;
+
+    return error.ProviderError;
+}
+
+fn classifyApiError(root: std.json.Value) ?ProviderError {
     const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse return null) orelse return null;
 
     if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
@@ -379,6 +424,33 @@ fn mapApiErrorFromJson(root: std.json.Value) ?ProviderError {
     if (std.mem.eql(u8, err_type, "permission_error")) return error.AuthenticationFailed;
 
     return error.ProviderError;
+}
+
+fn storeErrorDetails(self: *Anthropic, err_type: []const u8, err_message: []const u8) void {
+    self.clearLastError();
+    const duped_message = self.allocator.dupe(u8, err_message) catch return;
+    const duped_type = self.allocator.dupe(u8, err_type) catch {
+        self.allocator.free(duped_message);
+        return;
+    };
+    self.last_error = .{
+        .message = duped_message,
+        .error_type = duped_type,
+        .allocator = self.allocator,
+    };
+}
+
+fn parseCompletionResponseWithErrorCapture(self: *Anthropic, body: []const u8, allocator: Allocator) ProviderError!Provider.CompletionResponse {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    defer parsed.deinit();
+    const root = parsed.value;
+
+    // Check for API error in response body
+    if (jh.getPath(root, "error.type")) |_| {
+        return self.mapApiErrorFromJson(root) orelse error.ProviderError;
+    }
+
+    return parseCompletionFromParsedJson(root, allocator);
 }
 
 // --- Stream context ---
@@ -668,8 +740,104 @@ test "mapApiErrorFromJson" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
     defer parsed.deinit();
 
-    const err = mapApiErrorFromJson(parsed.value);
+    const err = classifyApiError(parsed.value);
     try std.testing.expectEqual(@as(?ProviderError, error.AuthenticationFailed), err);
+}
+
+test "mapApiErrorFromJson captures error details" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"authentication_error\",\"message\":\"Your API key has been revoked\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = anthropic.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.AuthenticationFailed), err);
+
+    // Verify error details were captured
+    try std.testing.expectEqualStrings("Your API key has been revoked", anthropic.lastError().?);
+    const details = anthropic.lastErrorDetails().?;
+    try std.testing.expectEqualStrings("authentication_error", details.error_type);
+    try std.testing.expectEqualStrings("Your API key has been revoked", details.message);
+}
+
+test "mapApiErrorFromJson captures rate limit error details" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Rate limit exceeded, please slow down\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = anthropic.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.RateLimited), err);
+
+    try std.testing.expectEqualStrings("Rate limit exceeded, please slow down", anthropic.lastError().?);
+}
+
+test "clearLastError clears previous error" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"Server is overloaded\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    _ = anthropic.mapApiErrorFromJson(parsed.value);
+    try std.testing.expect(anthropic.lastError() != null);
+
+    anthropic.clearLastError();
+    try std.testing.expect(anthropic.lastError() == null);
+}
+
+test "last_error is null when no error has occurred" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    try std.testing.expect(anthropic.lastError() == null);
+    try std.testing.expect(anthropic.lastErrorDetails() == null);
+}
+
+test "mapApiErrorFromJson captures unknown error type" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"some_new_error\",\"message\":\"Something unexpected happened\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = anthropic.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.ProviderError), err);
+
+    try std.testing.expectEqualStrings("Something unexpected happened", anthropic.lastError().?);
+    try std.testing.expectEqualStrings("some_new_error", anthropic.lastErrorDetails().?.error_type);
+}
+
+test "successive errors replace previous error details" {
+    const allocator = std.testing.allocator;
+    var anthropic = try Anthropic.init(allocator, .{ .api_key = "test" });
+    defer anthropic.deinit();
+
+    // First error
+    const error_json1 = "{\"error\":{\"type\":\"authentication_error\",\"message\":\"Invalid key\"}}";
+    const parsed1 = try std.json.parseFromSlice(std.json.Value, allocator, error_json1, .{});
+    defer parsed1.deinit();
+    _ = anthropic.mapApiErrorFromJson(parsed1.value);
+    try std.testing.expectEqualStrings("Invalid key", anthropic.lastError().?);
+
+    // Second error replaces first
+    const error_json2 = "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests\"}}";
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, error_json2, .{});
+    defer parsed2.deinit();
+    _ = anthropic.mapApiErrorFromJson(parsed2.value);
+    try std.testing.expectEqualStrings("Too many requests", anthropic.lastError().?);
+    try std.testing.expectEqualStrings("rate_limit_error", anthropic.lastErrorDetails().?.error_type);
 }
 
 test "known models list" {

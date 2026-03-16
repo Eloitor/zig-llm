@@ -2,7 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Provider = @import("../Provider.zig");
 const types = @import("../types.zig");
-const ProviderError = @import("../errors.zig").ProviderError;
+const errors = @import("../errors.zig");
+const ProviderError = errors.ProviderError;
 const http = @import("../http.zig");
 const sse = @import("../sse.zig");
 const jh = @import("../json_helpers.zig");
@@ -12,6 +13,7 @@ const OpenAI = @This();
 allocator: Allocator,
 api_key: []const u8,
 api_base: []const u8,
+last_error: ?errors.ErrorDetails = null,
 
 pub const Config = struct {
     api_key: []const u8,
@@ -32,7 +34,26 @@ pub fn init(allocator: Allocator, config: Config) ProviderError!*OpenAI {
 }
 
 pub fn deinit(self: *OpenAI) void {
+    self.clearLastError();
     self.allocator.destroy(self);
+}
+
+pub fn lastError(self: *const OpenAI) ?[]const u8 {
+    if (self.last_error) |details| {
+        return details.message;
+    }
+    return null;
+}
+
+pub fn lastErrorDetails(self: *const OpenAI) ?errors.ErrorDetails {
+    return self.last_error;
+}
+
+fn clearLastError(self: *OpenAI) void {
+    if (self.last_error) |*details| {
+        details.deinit();
+        self.last_error = null;
+    }
 }
 
 pub fn provider(self: *OpenAI) Provider {
@@ -42,6 +63,8 @@ pub fn provider(self: *OpenAI) Provider {
 // --- Provider interface implementation ---
 
 pub fn complete(self: *OpenAI, request: Provider.CompletionRequest, allocator: Allocator) ProviderError!Provider.CompletionResponse {
+    self.clearLastError();
+
     const body = buildRequestBody(request, false, allocator) catch return error.OutOfMemory;
     defer allocator.free(body);
 
@@ -49,13 +72,15 @@ pub fn complete(self: *OpenAI, request: Provider.CompletionRequest, allocator: A
     defer resp.deinit();
 
     if (http.mapStatusError(resp.status)) |err| {
-        return mapApiError(resp.body) orelse err;
+        return self.mapApiError(resp.body) orelse err;
     }
 
-    return parseCompletionResponse(resp.body, allocator);
+    return self.parseCompletionResponseWithErrorCapture(resp.body, allocator);
 }
 
 pub fn stream(self: *OpenAI, request: Provider.CompletionRequest, allocator: Allocator) ProviderError!Provider.StreamIterator {
+    self.clearLastError();
+
     const body = buildRequestBody(request, true, allocator) catch return error.OutOfMemory;
     defer allocator.free(body);
 
@@ -367,12 +392,16 @@ fn parseCompletionResponse(body: []const u8, allocator: Allocator) ProviderError
 
     // Check for API error in response body
     if (jh.getPath(root, "error.type")) |_| {
-        return mapApiErrorFromJson(root) orelse error.ProviderError;
+        return classifyApiError(root) orelse error.ProviderError;
     }
     if (jh.getPath(root, "error.code")) |_| {
-        return mapApiErrorFromJson(root) orelse error.ProviderError;
+        return classifyApiError(root) orelse error.ProviderError;
     }
 
+    return parseCompletionFromParsedJson(root, allocator);
+}
+
+fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) ProviderError!Provider.CompletionResponse {
     const model_str = jh.getJsonString(jh.getPath(root, "model") orelse return error.InvalidResponse) orelse return error.InvalidResponse;
     const model = allocator.dupe(u8, model_str) catch return error.OutOfMemory;
     errdefer allocator.free(model);
@@ -457,13 +486,35 @@ fn intToU32(v: ?i64) u32 {
 
 // --- Error mapping ---
 
-fn mapApiError(body: []const u8) ?ProviderError {
+fn mapApiError(self: *OpenAI, body: []const u8) ?ProviderError {
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return null;
     defer parsed.deinit();
-    return mapApiErrorFromJson(parsed.value);
+    return self.mapApiErrorFromJson(parsed.value);
 }
 
-fn mapApiErrorFromJson(root: std.json.Value) ?ProviderError {
+fn mapApiErrorFromJson(self: *OpenAI, root: std.json.Value) ?ProviderError {
+    // OpenAI errors can have error.type or error.code
+    const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse
+        jh.getPath(root, "error.code") orelse return null) orelse return null;
+    const err_message = if (jh.getPath(root, "error.message")) |msg_val| (jh.getJsonString(msg_val) orelse "unknown error") else "unknown error";
+
+    self.storeErrorDetails(err_type, err_message);
+
+    if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
+    if (std.mem.eql(u8, err_type, "invalid_api_key")) return error.AuthenticationFailed;
+    if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
+    if (std.mem.eql(u8, err_type, "rate_limit_exceeded")) return error.RateLimited;
+    if (std.mem.eql(u8, err_type, "invalid_request_error")) return error.InvalidRequest;
+    if (std.mem.eql(u8, err_type, "model_not_found")) return error.ModelNotFound;
+    if (std.mem.eql(u8, err_type, "not_found_error")) return error.ModelNotFound;
+    if (std.mem.eql(u8, err_type, "server_error")) return error.ProviderError;
+    if (std.mem.eql(u8, err_type, "overloaded_error")) return error.Overloaded;
+    if (std.mem.eql(u8, err_type, "context_length_exceeded")) return error.ContextOverflow;
+
+    return error.ProviderError;
+}
+
+fn classifyApiError(root: std.json.Value) ?ProviderError {
     // OpenAI errors can have error.type or error.code
     const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse
         jh.getPath(root, "error.code") orelse return null) orelse return null;
@@ -480,6 +531,36 @@ fn mapApiErrorFromJson(root: std.json.Value) ?ProviderError {
     if (std.mem.eql(u8, err_type, "context_length_exceeded")) return error.ContextOverflow;
 
     return error.ProviderError;
+}
+
+fn storeErrorDetails(self: *OpenAI, err_type: []const u8, err_message: []const u8) void {
+    self.clearLastError();
+    const duped_message = self.allocator.dupe(u8, err_message) catch return;
+    const duped_type = self.allocator.dupe(u8, err_type) catch {
+        self.allocator.free(duped_message);
+        return;
+    };
+    self.last_error = .{
+        .message = duped_message,
+        .error_type = duped_type,
+        .allocator = self.allocator,
+    };
+}
+
+fn parseCompletionResponseWithErrorCapture(self: *OpenAI, body: []const u8, allocator: Allocator) ProviderError!Provider.CompletionResponse {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    defer parsed.deinit();
+    const root = parsed.value;
+
+    // Check for API error in response body
+    if (jh.getPath(root, "error.type")) |_| {
+        return self.mapApiErrorFromJson(root) orelse error.ProviderError;
+    }
+    if (jh.getPath(root, "error.code")) |_| {
+        return self.mapApiErrorFromJson(root) orelse error.ProviderError;
+    }
+
+    return parseCompletionFromParsedJson(root, allocator);
 }
 
 // --- Stream context ---
@@ -885,7 +966,7 @@ test "mapApiErrorFromJson" {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
         defer parsed.deinit();
 
-        const err = mapApiErrorFromJson(parsed.value);
+        const err = classifyApiError(parsed.value);
         try std.testing.expectEqual(@as(?ProviderError, error.AuthenticationFailed), err);
     }
 
@@ -895,9 +976,104 @@ test "mapApiErrorFromJson" {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
         defer parsed.deinit();
 
-        const err = mapApiErrorFromJson(parsed.value);
+        const err = classifyApiError(parsed.value);
         try std.testing.expectEqual(@as(?ProviderError, error.RateLimited), err);
     }
+}
+
+test "mapApiErrorFromJson captures error details via type" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"invalid_api_key\",\"message\":\"Incorrect API key provided\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = openai.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.AuthenticationFailed), err);
+
+    try std.testing.expectEqualStrings("Incorrect API key provided", openai.lastError().?);
+    const details = openai.lastErrorDetails().?;
+    try std.testing.expectEqualStrings("invalid_api_key", details.error_type);
+    try std.testing.expectEqualStrings("Incorrect API key provided", details.message);
+}
+
+test "mapApiErrorFromJson captures error details via code" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    const error_json = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for model\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = openai.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.RateLimited), err);
+
+    try std.testing.expectEqualStrings("Rate limit reached for model", openai.lastError().?);
+    try std.testing.expectEqualStrings("rate_limit_exceeded", openai.lastErrorDetails().?.error_type);
+}
+
+test "clearLastError clears previous error" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    const error_json = "{\"error\":{\"type\":\"server_error\",\"message\":\"Internal server error\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    _ = openai.mapApiErrorFromJson(parsed.value);
+    try std.testing.expect(openai.lastError() != null);
+
+    openai.clearLastError();
+    try std.testing.expect(openai.lastError() == null);
+}
+
+test "last_error is null when no error has occurred" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    try std.testing.expect(openai.lastError() == null);
+    try std.testing.expect(openai.lastErrorDetails() == null);
+}
+
+test "mapApiErrorFromJson captures context overflow error" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    const error_json = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"This model's maximum context length is 4097 tokens\"}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_json, .{});
+    defer parsed.deinit();
+
+    const err = openai.mapApiErrorFromJson(parsed.value);
+    try std.testing.expectEqual(@as(?ProviderError, error.ContextOverflow), err);
+
+    try std.testing.expectEqualStrings("This model's maximum context length is 4097 tokens", openai.lastError().?);
+}
+
+test "successive errors replace previous error details" {
+    const allocator = std.testing.allocator;
+    var openai = try OpenAI.init(allocator, .{ .api_key = "test" });
+    defer openai.deinit();
+
+    // First error
+    const error_json1 = "{\"error\":{\"type\":\"invalid_api_key\",\"message\":\"Bad key\"}}";
+    const parsed1 = try std.json.parseFromSlice(std.json.Value, allocator, error_json1, .{});
+    defer parsed1.deinit();
+    _ = openai.mapApiErrorFromJson(parsed1.value);
+    try std.testing.expectEqualStrings("Bad key", openai.lastError().?);
+
+    // Second error replaces first
+    const error_json2 = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Too many requests\"}}";
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, error_json2, .{});
+    defer parsed2.deinit();
+    _ = openai.mapApiErrorFromJson(parsed2.value);
+    try std.testing.expectEqualStrings("Too many requests", openai.lastError().?);
+    try std.testing.expectEqualStrings("rate_limit_exceeded", openai.lastErrorDetails().?.error_type);
 }
 
 test "known models list" {
