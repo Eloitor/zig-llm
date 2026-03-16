@@ -263,7 +263,7 @@ fn writeMessage(jw: anytype, msg: types.Message, allocator: Allocator) !void {
                 }
                 try jw.endArray();
             } else {
-                // Simple string content
+                // Simple string content — concatenate all text blocks
                 try jw.field("content");
                 if (msg.content.len == 1) {
                     switch (msg.content[0]) {
@@ -271,20 +271,22 @@ fn writeMessage(jw: anytype, msg: types.Message, allocator: Allocator) !void {
                         else => try jw.valueString(""),
                     }
                 } else {
-                    // Multiple text blocks — concatenate or use first
-                    var found_text = false;
+                    // Concatenate all text blocks
+                    var combined = std.ArrayList(u8).init(allocator);
+                    defer combined.deinit();
                     for (msg.content) |block| {
                         switch (block) {
                             .text => |t| {
-                                if (!found_text) {
-                                    try jw.valueString(t.text);
-                                    found_text = true;
-                                }
+                                try combined.appendSlice(t.text);
                             },
                             else => {},
                         }
                     }
-                    if (!found_text) try jw.valueString("");
+                    if (combined.items.len > 0) {
+                        try jw.valueString(combined.items);
+                    } else {
+                        try jw.valueString("");
+                    }
                 }
             }
         },
@@ -935,4 +937,31 @@ test "stop sequences use stop field" {
 
     const first_stop = jh.getJsonString(jh.getPath(parsed.value, "stop.0").?).?;
     try std.testing.expectEqualStrings("END", first_stop);
+}
+
+test "buildRequestBody concatenates multiple text blocks" {
+    const allocator = std.testing.allocator;
+
+    var content = try allocator.alloc(types.ContentBlock, 2);
+    defer allocator.free(content);
+    content[0] = .{ .text = .{ .text = "Hello" } };
+    content[1] = .{ .text = .{ .text = " World" } };
+
+    const msgs = try allocator.alloc(types.Message, 1);
+    defer allocator.free(msgs);
+    msgs[0] = .{ .role = .user, .content = content, .allocator = allocator };
+
+    const body = try buildRequestBody(.{
+        .model = "gpt-4o",
+        .messages = msgs,
+    }, false, allocator);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const msg_content = jh.getJsonString(jh.getPath(parsed.value, "messages.0.content").?).?;
+    // Should contain both texts concatenated
+    try std.testing.expect(std.mem.indexOf(u8, msg_content, "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg_content, "World") != null);
 }
