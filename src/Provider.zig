@@ -75,6 +75,10 @@ pub const CompletionRequest = struct {
     tools: []const types.ToolDefinition = &.{},
     max_tokens: u32 = 4096,
     temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?u32 = null,
+    frequency_penalty: ?f32 = null,
+    presence_penalty: ?f32 = null,
     stop_sequences: []const []const u8 = &.{},
 };
 
