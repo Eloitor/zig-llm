@@ -27,7 +27,7 @@ pub fn init(allocator: Allocator, prov: Provider, model: []const u8) Chat {
         .allocator = allocator,
         .provider = prov,
         .model = model,
-        .history = std.ArrayList(types.Message).init(allocator),
+        .history = .{},
     };
 }
 
@@ -35,7 +35,7 @@ pub fn deinit(self: *Chat) void {
     for (self.history.items) |msg| {
         msg.deinit();
     }
-    self.history.deinit();
+    self.history.deinit(self.allocator);
 }
 
 /// Send a text message and get a completion response.
@@ -56,7 +56,7 @@ pub fn send(self: *Chat, text: []const u8) ProviderError!Provider.CompletionResp
 
     // Clone assistant message for history
     const history_msg = cloneMessage(response.message, self.allocator) catch return error.OutOfMemory;
-    self.history.append(history_msg) catch return error.OutOfMemory;
+    self.history.append(self.allocator, history_msg) catch return error.OutOfMemory;
 
     return response;
 }
@@ -96,7 +96,7 @@ pub const StreamResponse = struct {
         pub fn deinit(self: *AccumulatedToolCall, allocator: Allocator) void {
             allocator.free(self.id);
             allocator.free(self.name);
-            self.input_buf.deinit();
+            self.input_buf.deinit(allocator);
         }
     };
 
@@ -105,8 +105,8 @@ pub const StreamResponse = struct {
             .chat = chat,
             .iterator = iterator,
             .allocator = allocator,
-            .text_buf = std.ArrayList(u8).init(allocator),
-            .tool_calls = std.ArrayList(AccumulatedToolCall).init(allocator),
+            .text_buf = .{},
+            .tool_calls = .{},
             .finished = false,
             .usage = .{},
             .stop_reason = .unknown,
@@ -121,19 +121,19 @@ pub const StreamResponse = struct {
         // Accumulate based on event type
         switch (event) {
             .text_delta => |td| {
-                self.text_buf.appendSlice(td.text) catch {};
+                self.text_buf.appendSlice(self.allocator, td.text) catch {};
             },
             .tool_use_start => |tu| {
-                self.tool_calls.append(.{
+                self.tool_calls.append(self.allocator, .{
                     .id = self.allocator.dupe(u8, tu.id) catch return error.OutOfMemory,
                     .name = self.allocator.dupe(u8, tu.name) catch return error.OutOfMemory,
-                    .input_buf = std.ArrayList(u8).init(self.allocator),
+                    .input_buf = .{},
                 }) catch return error.OutOfMemory;
             },
             .tool_input_delta => |tid| {
                 if (self.tool_calls.items.len > 0) {
                     var last = &self.tool_calls.items[self.tool_calls.items.len - 1];
-                    last.input_buf.appendSlice(tid.json) catch {};
+                    last.input_buf.appendSlice(self.allocator, tid.json) catch {};
                 }
             },
             .message_delta => |md| {
@@ -160,9 +160,12 @@ pub const StreamResponse = struct {
         if (total_blocks == 0) return;
 
         var content = self.allocator.alloc(types.ContentBlock, total_blocks) catch return;
-        errdefer self.allocator.free(content);
-
         var idx: usize = 0;
+        errdefer {
+            // Free any blocks we already populated before the failure
+            for (content[0..idx]) |block| block.deinit(self.allocator);
+            self.allocator.free(content);
+        }
 
         // Add text block if we accumulated any text
         if (self.text_buf.items.len > 0) {
@@ -174,10 +177,16 @@ pub const StreamResponse = struct {
 
         // Add tool_use blocks
         for (self.tool_calls.items) |tc| {
+            const id = self.allocator.dupe(u8, tc.id) catch return;
+            errdefer self.allocator.free(id);
+            const name = self.allocator.dupe(u8, tc.name) catch return;
+            errdefer self.allocator.free(name);
+            const input_json = self.allocator.dupe(u8, tc.input_buf.items) catch return;
+
             content[idx] = .{ .tool_use = .{
-                .id = self.allocator.dupe(u8, tc.id) catch return,
-                .name = self.allocator.dupe(u8, tc.name) catch return,
-                .input_json = self.allocator.dupe(u8, tc.input_buf.items) catch return,
+                .id = id,
+                .name = name,
+                .input_json = input_json,
             } };
             idx += 1;
         }
@@ -186,7 +195,7 @@ pub const StreamResponse = struct {
         self.chat.total_usage = self.chat.total_usage.add(self.usage);
 
         // Append assistant message to history
-        self.chat.history.append(.{
+        self.chat.history.append(self.allocator, .{
             .role = .assistant,
             .content = content,
             .allocator = self.allocator,
@@ -205,11 +214,11 @@ pub const StreamResponse = struct {
         }
 
         // Clean up accumulated state
-        self.text_buf.deinit();
+        self.text_buf.deinit(self.allocator);
         for (self.tool_calls.items) |*tc| {
             tc.deinit(self.allocator);
         }
-        self.tool_calls.deinit();
+        self.tool_calls.deinit(self.allocator);
 
         // Clean up the underlying iterator
         self.iterator.deinit();
@@ -268,15 +277,15 @@ fn sendWithToolsImpl(
         // Collect all tool calls. We dupe the ids (needed after response.deinit()),
         // but name and input_json borrow from the response and stay valid until
         // all handlers have returned.
-        var calls = std.ArrayList(PendingToolCall).init(self.allocator);
+        var calls: std.ArrayList(PendingToolCall) = .{};
         defer {
             for (calls.items) |c| self.allocator.free(c.id);
-            calls.deinit();
+            calls.deinit(self.allocator);
         }
 
         var tool_iter = response.message.toolUseBlocks();
         while (tool_iter.next()) |tc| {
-            calls.append(.{
+            calls.append(self.allocator, .{
                 .id = self.allocator.dupe(u8, tc.id) catch return error.OutOfMemory,
                 .name = tc.name,
                 .input_json = tc.input_json,
@@ -292,15 +301,15 @@ fn sendWithToolsImpl(
                 }
             };
 
-            var threads = std.ArrayList(std.Thread).init(self.allocator);
-            defer threads.deinit();
+            var threads: std.ArrayList(std.Thread) = .{};
+            defer threads.deinit(self.allocator);
 
             for (calls.items[0 .. calls.items.len -| 1]) |*c| {
                 const t = std.Thread.spawn(.{}, Dispatch.run, .{ context, c }) catch {
                     c.result = handleToolCall(context, c.name, c.input_json);
                     continue;
                 };
-                threads.append(t) catch {
+                threads.append(self.allocator, t) catch {
                     t.join();
                     continue;
                 };
@@ -347,7 +356,7 @@ pub fn sendToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8,
     self.total_usage = self.total_usage.add(response.usage);
 
     const history_msg = cloneMessage(response.message, self.allocator) catch return error.OutOfMemory;
-    self.history.append(history_msg) catch return error.OutOfMemory;
+    self.history.append(self.allocator, history_msg) catch return error.OutOfMemory;
 
     return response;
 }
@@ -355,7 +364,7 @@ pub fn sendToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8,
 /// Add an assembled assistant message to history (e.g., after consuming a stream).
 pub fn appendAssistantMessage(self: *Chat, message: types.Message) ProviderError!void {
     const cloned = cloneMessage(message, self.allocator) catch return error.OutOfMemory;
-    self.history.append(cloned) catch return error.OutOfMemory;
+    self.history.append(self.allocator, cloned) catch return error.OutOfMemory;
 }
 
 /// Clear conversation history.
@@ -386,7 +395,7 @@ fn buildRequest(self: *Chat) Provider.CompletionRequest {
 fn appendUserMessage(self: *Chat, text: []const u8) ProviderError!void {
     var content = self.allocator.alloc(types.ContentBlock, 1) catch return error.OutOfMemory;
     content[0] = .{ .text = .{ .text = self.allocator.dupe(u8, text) catch return error.OutOfMemory } };
-    self.history.append(.{
+    self.history.append(self.allocator, .{
         .role = .user,
         .content = content,
         .allocator = self.allocator,
@@ -402,8 +411,8 @@ fn appendToolCallResults(self: *Chat, calls: []const PendingToolCall) ProviderEr
             .is_error = c.result.is_error,
         } };
     }
-    self.history.append(.{
-        .role = .user,
+    self.history.append(self.allocator, .{
+        .role = .tool,
         .content = blocks,
         .allocator = self.allocator,
     }) catch return error.OutOfMemory;
@@ -415,7 +424,7 @@ fn completeAndRecord(self: *Chat) ProviderError!Provider.CompletionResponse {
     const response = try self.completeWithRetry(request);
     self.total_usage = self.total_usage.add(response.usage);
     const history_msg = cloneMessage(response.message, self.allocator) catch return error.OutOfMemory;
-    self.history.append(history_msg) catch return error.OutOfMemory;
+    self.history.append(self.allocator, history_msg) catch return error.OutOfMemory;
     return response;
 }
 
@@ -424,8 +433,6 @@ fn completeWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderE
     const retry_cfg = self.retry_config orelse return self.provider.complete(request, self.allocator);
 
     var attempt: u32 = 0;
-    var delay_ms: u64 = retry_cfg.initial_delay_ms;
-
     while (true) {
         const result = self.provider.complete(request, self.allocator);
         if (result) |response| {
@@ -434,9 +441,8 @@ fn completeWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderE
             if (!retry.isRetryable(err) or attempt >= retry_cfg.max_retries) {
                 return err;
             }
+            retry.sleepMs(retry.computeDelay(retry_cfg, attempt));
             attempt += 1;
-            std.time.sleep(delay_ms * std.time.ns_per_ms);
-            delay_ms = @min(delay_ms * retry_cfg.backoff_multiplier, retry_cfg.max_delay_ms);
         }
     }
 }
@@ -448,8 +454,6 @@ fn streamWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderErr
     const retry_cfg = self.retry_config orelse return self.provider.stream(request, self.allocator);
 
     var attempt: u32 = 0;
-    var delay_ms: u64 = retry_cfg.initial_delay_ms;
-
     while (true) {
         const result = self.provider.stream(request, self.allocator);
         if (result) |iter| {
@@ -458,9 +462,8 @@ fn streamWithRetry(self: *Chat, request: Provider.CompletionRequest) ProviderErr
             if (!retry.isRetryable(err) or attempt >= retry_cfg.max_retries) {
                 return err;
             }
+            retry.sleepMs(retry.computeDelay(retry_cfg, attempt));
             attempt += 1;
-            std.time.sleep(delay_ms * std.time.ns_per_ms);
-            delay_ms = @min(delay_ms * retry_cfg.backoff_multiplier, retry_cfg.max_delay_ms);
         }
     }
 }
@@ -472,7 +475,7 @@ fn appendToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8, i
         .content = self.allocator.dupe(u8, content) catch return error.OutOfMemory,
         .is_error = is_error,
     } };
-    self.history.append(.{
+    self.history.append(self.allocator, .{
         .role = .tool,
         .content = blocks,
         .allocator = self.allocator,
@@ -699,13 +702,13 @@ test "StreamResponse automatically appends history after stream completes" {
     try std.testing.expectEqual(types.Role.user, chat.history.items[0].role);
 
     // Consume the stream fully
-    var full_text = std.ArrayList(u8).init(allocator);
-    defer full_text.deinit();
+    var full_text: std.ArrayList(u8) = .{};
+    defer full_text.deinit(allocator);
 
     while (try stream.next()) |event| {
         switch (event) {
             .text_delta => |td| {
-                try full_text.appendSlice(td.text);
+                try full_text.appendSlice(allocator, td.text);
                 event.deinit(allocator);
             },
             .message_stop => {

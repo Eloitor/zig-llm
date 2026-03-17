@@ -26,10 +26,11 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse {
+    const api_key = std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch {
         std.debug.print("Error: ANTHROPIC_API_KEY environment variable not set\n", .{});
         return;
     };
+    defer allocator.free(api_key);
 
     var anthropic = try llm.providers.Anthropic.init(allocator, .{
         .api_key = api_key,

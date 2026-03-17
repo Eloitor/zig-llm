@@ -183,19 +183,16 @@ pub fn getPath(value: std.json.Value, path: []const u8) ?std.json.Value {
 
 /// Stringify a std.json.Value to an owned JSON string.
 pub fn stringifyValue(allocator: Allocator, value: std.json.Value) ![]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
-    try std.json.stringify(value, .{}, buf.writer());
-    return buf.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 // --- Tests ---
 
 test "JsonWriter basic object" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
 
-    var jw = jsonWriter(buf.writer());
+    var jw = jsonWriter(buf.writer(std.testing.allocator));
     try jw.beginObject();
     try jw.field("name");
     try jw.valueString("Claude");
@@ -207,10 +204,10 @@ test "JsonWriter basic object" {
 }
 
 test "JsonWriter nested" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
 
-    var jw = jsonWriter(buf.writer());
+    var jw = jsonWriter(buf.writer(std.testing.allocator));
     try jw.beginObject();
     try jw.field("items");
     try jw.beginArray();
@@ -223,10 +220,10 @@ test "JsonWriter nested" {
 }
 
 test "JsonWriter escaping" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
 
-    var jw = jsonWriter(buf.writer());
+    var jw = jsonWriter(buf.writer(std.testing.allocator));
     try jw.valueString("hello \"world\"\nnewline");
 
     try std.testing.expectEqualStrings("\"hello \\\"world\\\"\\nnewline\"", buf.items);
@@ -242,10 +239,10 @@ test "getPath navigation" {
 }
 
 test "JsonWriter handles deep nesting" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
 
-    var jw = jsonWriter(buf.writer());
+    var jw = jsonWriter(buf.writer(std.testing.allocator));
 
     // Nest to a reasonable depth
     for (0..100) |_| {
@@ -259,10 +256,10 @@ test "JsonWriter handles deep nesting" {
 }
 
 test "JsonWriter rejects excessive depth" {
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
 
-    var jw = jsonWriter(buf.writer());
+    var jw = jsonWriter(buf.writer(std.testing.allocator));
 
     // Try to exceed max depth
     var i: usize = 0;

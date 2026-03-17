@@ -200,13 +200,13 @@ test "MockProvider stream" {
     e1.deinit(allocator);
 
     // Should get text deltas
-    var full_text = std.ArrayList(u8).init(allocator);
-    defer full_text.deinit();
+    var full_text: std.ArrayList(u8) = .{};
+    defer full_text.deinit(allocator);
 
     while (try iter.next()) |event| {
         switch (event) {
             .text_delta => |td| {
-                try full_text.appendSlice(td.text);
+                try full_text.appendSlice(allocator, td.text);
                 event.deinit(allocator);
             },
             .message_stop => break,

@@ -35,7 +35,7 @@ pub fn computeDelay(config: RetryConfig, attempt: u32) u64 {
 
 /// Sleep for the given number of milliseconds.
 pub fn sleepMs(ms: u64) void {
-    std.time.sleep(ms * std.time.ns_per_ms);
+    std.Thread.sleep(ms * std.time.ns_per_ms);
 }
 
 // --- Tests ---

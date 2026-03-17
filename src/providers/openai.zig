@@ -105,7 +105,7 @@ pub fn stream(self: *OpenAI, request: Provider.CompletionRequest, allocator: All
         .finish_reason = null,
         .pending_usage = null,
         .pending_stop = false,
-        .current_tool_calls = std.ArrayList(PendingToolCall).init(allocator),
+        .current_tool_calls = .{},
     };
 
     return Provider.StreamIterator.initFrom(ctx);
@@ -134,9 +134,9 @@ fn doPost(self: *OpenAI, body: []const u8, allocator: Allocator) ProviderError!h
 // --- Request building ---
 
 fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, allocator: Allocator) ![]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
-    var jw = jh.jsonWriter(buf.writer());
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var jw = jh.jsonWriter(buf.writer(allocator));
 
     try jw.beginObject();
 
@@ -248,7 +248,7 @@ fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, alloca
 
     try jw.endObject();
 
-    return buf.toOwnedSlice();
+    return buf.toOwnedSlice(allocator);
 }
 
 fn writeMessage(jw: anytype, msg: types.Message, allocator: Allocator) !void {
@@ -312,12 +312,12 @@ fn writeMessage(jw: anytype, msg: types.Message, allocator: Allocator) !void {
                     }
                 } else {
                     // Concatenate all text blocks
-                    var combined = std.ArrayList(u8).init(allocator);
-                    defer combined.deinit();
+                    var combined: std.ArrayList(u8) = .{};
+                    defer combined.deinit(allocator);
                     for (msg.content) |block| {
                         switch (block) {
                             .text => |t| {
-                                try combined.appendSlice(t.text);
+                                try combined.appendSlice(allocator, t.text);
                             },
                             else => {},
                         }
@@ -430,13 +430,13 @@ fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) Pro
     const usage = parseUsage(jh.getPath(root, "usage"));
 
     // Parse content — text from choices.0.message.content, tool_calls from choices.0.message.tool_calls
-    var content_blocks = std.ArrayList(types.ContentBlock).init(allocator);
-    defer content_blocks.deinit();
+    var content_blocks: std.ArrayList(types.ContentBlock) = .{};
+    defer content_blocks.deinit(allocator);
 
     if (jh.getPath(root, "choices.0.message.content")) |content_val| {
         if (jh.getJsonString(content_val)) |text| {
             if (text.len > 0) {
-                content_blocks.append(.{ .text = .{
+                content_blocks.append(allocator, .{ .text = .{
                     .text = allocator.dupe(u8, text) catch return error.OutOfMemory,
                 } }) catch return error.OutOfMemory;
             }
@@ -451,7 +451,7 @@ fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) Pro
                 const name = jh.getJsonString(jh.getPath(tc_item, "function.name") orelse continue) orelse continue;
                 const arguments = jh.getJsonString(jh.getPath(tc_item, "function.arguments") orelse continue) orelse continue;
 
-                content_blocks.append(.{ .tool_use = .{
+                content_blocks.append(allocator, .{ .tool_use = .{
                     .id = allocator.dupe(u8, id) catch return error.OutOfMemory,
                     .name = allocator.dupe(u8, name) catch return error.OutOfMemory,
                     .input_json = allocator.dupe(u8, arguments) catch return error.OutOfMemory,
@@ -460,7 +460,7 @@ fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) Pro
         }
     }
 
-    const content = content_blocks.toOwnedSlice() catch return error.OutOfMemory;
+    const content = content_blocks.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
     return .{
         .message = .{
@@ -517,25 +517,17 @@ fn mapApiErrorFromJson(self: *OpenAI, root: std.json.Value) ?ProviderError {
 
     self.storeErrorDetails(err_type, err_message);
 
-    if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
-    if (std.mem.eql(u8, err_type, "invalid_api_key")) return error.AuthenticationFailed;
-    if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
-    if (std.mem.eql(u8, err_type, "rate_limit_exceeded")) return error.RateLimited;
-    if (std.mem.eql(u8, err_type, "invalid_request_error")) return error.InvalidRequest;
-    if (std.mem.eql(u8, err_type, "model_not_found")) return error.ModelNotFound;
-    if (std.mem.eql(u8, err_type, "not_found_error")) return error.ModelNotFound;
-    if (std.mem.eql(u8, err_type, "server_error")) return error.ProviderError;
-    if (std.mem.eql(u8, err_type, "overloaded_error")) return error.Overloaded;
-    if (std.mem.eql(u8, err_type, "context_length_exceeded")) return error.ContextOverflow;
-
-    return error.ProviderError;
+    return classifyErrorType(err_type);
 }
 
 fn classifyApiError(root: std.json.Value) ?ProviderError {
     // OpenAI errors can have error.type or error.code
     const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse
         jh.getPath(root, "error.code") orelse return null) orelse return null;
+    return classifyErrorType(err_type);
+}
 
+fn classifyErrorType(err_type: []const u8) ProviderError {
     if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
     if (std.mem.eql(u8, err_type, "invalid_api_key")) return error.AuthenticationFailed;
     if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
@@ -725,7 +717,7 @@ const StreamContext = struct {
 
         // Ensure we have enough slots
         while (self.current_tool_calls.items.len <= index) {
-            self.current_tool_calls.append(.{
+            self.current_tool_calls.append(self.allocator, .{
                 .id = null,
                 .name = null,
                 .started = false,
@@ -783,7 +775,7 @@ const StreamContext = struct {
             if (tc.id) |id| self.allocator.free(id);
             if (tc.name) |name| self.allocator.free(name);
         }
-        self.current_tool_calls.deinit();
+        self.current_tool_calls.deinit(self.allocator);
         self.sse_reader.deinit();
         self.http_stream.deinit();
         self.allocator.destroy(self);
@@ -1156,7 +1148,9 @@ test "first chunk with content delta emits both message_start and text_delta" {
         "data: [DONE]\n" ++
         "\n";
 
-    var fixed_stream = std.io.fixedBufferStream(sse_data);
+    // Heap-allocate the fixed reader so its address is stable for the SSE reader pointer
+    const fixed_reader = allocator.create(std.Io.Reader) catch unreachable;
+    fixed_reader.* = std.Io.Reader.fixed(sse_data);
 
     // Create a StreamContext on the heap, but with http_stream undefined
     // since we bypass it by providing our own sse_reader.
@@ -1164,13 +1158,13 @@ test "first chunk with content delta emits both message_start and text_delta" {
     ctx.* = .{
         .allocator = allocator,
         .http_stream = undefined, // We won't call http_stream methods
-        .sse_reader = sse.SseLineReader.init(fixed_stream.reader().any(), allocator),
+        .sse_reader = sse.SseLineReader.init(fixed_reader, allocator),
         .done = false,
         .sent_start = false,
         .finish_reason = null,
         .pending_usage = null,
         .pending_stop = false,
-        .current_tool_calls = std.ArrayList(PendingToolCall).init(allocator),
+        .current_tool_calls = .{},
     };
     // Manual cleanup — we can't call ctx.deinit() because http_stream is undefined
     defer {
@@ -1183,8 +1177,9 @@ test "first chunk with content delta emits both message_start and text_delta" {
             if (tc.id) |id| allocator.free(id);
             if (tc.name) |name| allocator.free(name);
         }
-        ctx.current_tool_calls.deinit();
+        ctx.current_tool_calls.deinit(allocator);
         ctx.sse_reader.deinit();
+        allocator.destroy(fixed_reader);
         allocator.destroy(ctx);
     }
 
@@ -1256,19 +1251,20 @@ test "first chunk with tool call delta emits message_start then tool_use_start" 
         "data: [DONE]\n" ++
         "\n";
 
-    var fixed_stream = std.io.fixedBufferStream(sse_data);
+    const fixed_reader = allocator.create(std.Io.Reader) catch unreachable;
+    fixed_reader.* = std.Io.Reader.fixed(sse_data);
 
     const ctx = allocator.create(StreamContext) catch unreachable;
     ctx.* = .{
         .allocator = allocator,
         .http_stream = undefined,
-        .sse_reader = sse.SseLineReader.init(fixed_stream.reader().any(), allocator),
+        .sse_reader = sse.SseLineReader.init(fixed_reader, allocator),
         .done = false,
         .sent_start = false,
         .finish_reason = null,
         .pending_usage = null,
         .pending_stop = false,
-        .current_tool_calls = std.ArrayList(PendingToolCall).init(allocator),
+        .current_tool_calls = .{},
     };
     defer {
         if (ctx.pending_event) |evt| {
@@ -1280,8 +1276,9 @@ test "first chunk with tool call delta emits message_start then tool_use_start" 
             if (tc.id) |id| allocator.free(id);
             if (tc.name) |name| allocator.free(name);
         }
-        ctx.current_tool_calls.deinit();
+        ctx.current_tool_calls.deinit(allocator);
         ctx.sse_reader.deinit();
+        allocator.destroy(fixed_reader);
         allocator.destroy(ctx);
     }
 

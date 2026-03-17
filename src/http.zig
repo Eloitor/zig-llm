@@ -18,20 +18,28 @@ pub const HttpResponse = struct {
 };
 
 const max_response_size = 10 * 1024 * 1024; // 10 MB
-const server_header_buf_size = 16 * 1024;
 
 /// A streaming HTTP connection that allows incremental reading of the response body.
-/// Client, request, and header buffer are heap-allocated so their addresses remain
+/// Client, request, and buffers are heap-allocated so their addresses remain
 /// stable for the lifetime of the stream.
 pub const HttpStream = struct {
     allocator: Allocator,
     client: *std.http.Client,
     request: *std.http.Client.Request,
-    server_header_buf: []u8,
+    redirect_buf: []u8,
+    transfer_buf: []u8,
+    cached_response: std.http.Client.Response,
 
     /// Returns a reader for incrementally reading the response body.
-    pub fn reader(self: *HttpStream) std.io.AnyReader {
-        return self.request.reader();
+    pub fn reader(self: *HttpStream) *std.Io.Reader {
+        // bodyReader modifies request.reader.interface and returns a pointer
+        // into request.reader, which is heap-allocated and stable.
+        const head = &self.cached_response.head;
+        return self.request.reader.bodyReader(
+            self.transfer_buf,
+            head.transfer_encoding,
+            head.content_length,
+        );
     }
 
     pub fn deinit(self: *HttpStream) void {
@@ -39,7 +47,8 @@ pub const HttpStream = struct {
         self.allocator.destroy(self.request);
         self.client.deinit();
         self.allocator.destroy(self.client);
-        self.allocator.free(self.server_header_buf);
+        self.allocator.free(self.redirect_buf);
+        self.allocator.free(self.transfer_buf);
         self.allocator.destroy(self);
     }
 };
@@ -62,37 +71,42 @@ pub fn openStream(
 
     const uri = std.Uri.parse(url) catch return error.InvalidRequest;
 
-    const header_buf = allocator.alloc(u8, server_header_buf_size) catch return error.OutOfMemory;
-    errdefer allocator.free(header_buf);
-
-    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
-    defer extra_headers.deinit();
+    var extra_headers: std.ArrayList(std.http.Header) = .{};
+    defer extra_headers.deinit(allocator);
     for (headers) |h| {
-        extra_headers.append(.{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
+        extra_headers.append(allocator, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
     }
-    extra_headers.append(.{ .name = "content-type", .value = "application/json" }) catch return error.OutOfMemory;
+    extra_headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch return error.OutOfMemory;
 
     const request = allocator.create(std.http.Client.Request) catch return error.OutOfMemory;
     errdefer allocator.destroy(request);
 
-    request.* = client.open(.POST, uri, .{
-        .server_header_buffer = header_buf,
+    request.* = client.request(.POST, uri, .{
         .extra_headers = extra_headers.items,
     }) catch return error.ConnectionFailed;
     errdefer request.deinit();
 
+    // Send the request body
     request.transfer_encoding = .{ .content_length = body.len };
-    request.send() catch return error.ConnectionFailed;
-    request.writeAll(body) catch return error.ConnectionFailed;
-    request.finish() catch return error.ConnectionFailed;
-    request.wait() catch return error.ConnectionFailed;
+    var body_writer = request.sendBodyUnflushed(&.{}) catch return error.ConnectionFailed;
+    body_writer.writer.writeAll(body) catch return error.ConnectionFailed;
+    body_writer.end() catch return error.ConnectionFailed;
+    if (request.connection) |conn| conn.flush() catch return error.ConnectionFailed;
 
-    const status = request.response.status;
-    if (mapStatusError(status)) |status_err| {
+    // Receive response headers
+    const redirect_buf = allocator.alloc(u8, 8 * 1024) catch return error.OutOfMemory;
+    errdefer allocator.free(redirect_buf);
+
+    const resp = request.receiveHead(redirect_buf) catch return error.ConnectionFailed;
+
+    if (mapStatusError(resp.head.status)) |status_err| {
         // Try to read the error body for better error mapping
-        const err_body = request.reader().readAllAlloc(allocator, max_response_size) catch {
-            return status_err;
-        };
+        const transfer_buf = allocator.alloc(u8, 4096) catch return status_err;
+        defer allocator.free(transfer_buf);
+
+        var resp_mut = resp;
+        var body_reader = resp_mut.reader(transfer_buf);
+        const err_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(max_response_size)) catch return status_err;
         defer allocator.free(err_body);
 
         // Try to parse API-specific error from body
@@ -112,12 +126,17 @@ pub fn openStream(
         return status_err;
     }
 
+    const transfer_buf = allocator.alloc(u8, 4096) catch return error.OutOfMemory;
+    errdefer allocator.free(transfer_buf);
+
     const stream = allocator.create(HttpStream) catch return error.OutOfMemory;
     stream.* = .{
         .allocator = allocator,
         .client = client,
         .request = request,
-        .server_header_buf = header_buf,
+        .redirect_buf = redirect_buf,
+        .transfer_buf = transfer_buf,
+        .cached_response = resp,
     };
 
     return stream;
@@ -135,29 +154,34 @@ pub fn post(
 
     const uri = std.Uri.parse(url) catch return error.InvalidRequest;
 
-    var server_header_buf: [16 * 1024]u8 = undefined;
-
-    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
-    defer extra_headers.deinit();
+    var extra_headers: std.ArrayList(std.http.Header) = .{};
+    defer extra_headers.deinit(allocator);
     for (headers) |h| {
-        extra_headers.append(.{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
+        extra_headers.append(allocator, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
     }
-    extra_headers.append(.{ .name = "content-type", .value = "application/json" }) catch return error.OutOfMemory;
+    extra_headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch return error.OutOfMemory;
 
-    var req = client.open(.POST, uri, .{
-        .server_header_buffer = &server_header_buf,
+    var req = client.request(.POST, uri, .{
         .extra_headers = extra_headers.items,
     }) catch return error.ConnectionFailed;
     defer req.deinit();
 
+    // Send the request body
     req.transfer_encoding = .{ .content_length = body.len };
-    req.send() catch return error.ConnectionFailed;
-    req.writeAll(body) catch return error.ConnectionFailed;
-    req.finish() catch return error.ConnectionFailed;
-    req.wait() catch return error.ConnectionFailed;
+    var body_writer = req.sendBodyUnflushed(&.{}) catch return error.ConnectionFailed;
+    body_writer.writer.writeAll(body) catch return error.ConnectionFailed;
+    body_writer.end() catch return error.ConnectionFailed;
+    if (req.connection) |conn| conn.flush() catch return error.ConnectionFailed;
 
-    const status = req.response.status;
-    const response_body = req.reader().readAllAlloc(allocator, max_response_size) catch return error.InvalidResponse;
+    // Receive response headers
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var resp = req.receiveHead(&redirect_buf) catch return error.ConnectionFailed;
+    const status = resp.head.status;
+
+    // Read the full response body
+    var transfer_buf: [4096]u8 = undefined;
+    var body_reader = resp.reader(&transfer_buf);
+    const response_body = body_reader.allocRemaining(allocator, std.Io.Limit.limited(max_response_size)) catch return error.InvalidResponse;
 
     return .{
         .status = status,

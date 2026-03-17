@@ -7,10 +7,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Get API key from environment
-    const api_key = std.posix.getenv("OPENAI_API_KEY") orelse {
+    const api_key = std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch {
         std.debug.print("Error: OPENAI_API_KEY environment variable not set\n", .{});
         return;
     };
+    defer allocator.free(api_key);
 
     // Create provider — use api_base to point at Groq, Ollama, Together, etc.
     var openai = try llm.providers.OpenAI.init(allocator, .{

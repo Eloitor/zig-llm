@@ -21,7 +21,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse return;
+    const api_key = try std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY");
+    defer allocator.free(api_key);
 
     var anthropic = try llm.providers.Anthropic.init(allocator, .{
         .api_key = api_key,
@@ -58,7 +59,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const api_key = std.posix.getenv("OPENAI_API_KEY") orelse return;
+    const api_key = try std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY");
+    defer allocator.free(api_key);
 
     // Point api_base at any OpenAI-compatible service
     var openai = try llm.providers.OpenAI.init(allocator, .{
@@ -84,11 +86,13 @@ pub fn main() !void {
 
 True incremental streaming -- tokens arrive as the API generates them, not buffered. Under the hood, the library holds an open HTTP connection and parses SSE events off the wire one at a time. You get an iterator and control the loop.
 
-```zig
-var iter = try chat.sendStreaming("Tell me a joke.");
-defer iter.deinit();
+Conversation history is managed automatically -- when the stream completes (or the `StreamResponse` is deinitialized), the assistant's response is appended to the chat history.
 
-while (try iter.next()) |event| {
+```zig
+var stream = try chat.sendStreaming("Tell me a joke.");
+defer stream.deinit();
+
+while (try stream.next()) |event| {
     switch (event) {
         .text_delta => |td| {
             std.debug.print("{s}", .{td.text});
@@ -98,6 +102,10 @@ while (try iter.next()) |event| {
         else => event.deinit(allocator),
     }
 }
+
+// History is already up to date -- just keep talking
+var followup = try chat.send("Tell me another one.");
+defer followup.deinit();
 ```
 
 ## Tool Use
@@ -137,7 +145,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse return;
+    const api_key = try std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY");
+    defer allocator.free(api_key);
 
     var anthropic = try llm.providers.Anthropic.init(allocator, .{ .api_key = api_key });
     defer anthropic.deinit();
@@ -161,6 +170,40 @@ var response = try chat.sendWithTools("query something", &my_app, MyApp.handleTo
 ```
 
 You can also drive the loop manually with `send()` + `sendToolResult()` if you need more control.
+
+## Error Handling
+
+When an API returns an error, you get both a Zig error (`ProviderError`) and the actual message from the API:
+
+```zig
+var response = chat.send("Hello!") catch |err| {
+    if (anthropic.lastError()) |msg| {
+        std.debug.print("API error: {s}\n", .{msg});
+    }
+    return err;
+};
+```
+
+## Retry
+
+Opt-in retry with exponential backoff for transient errors (rate limits, overloaded, timeouts):
+
+```zig
+chat.retry_config = .{ .max_retries = 3 };
+```
+
+## Sampling Parameters
+
+All the standard knobs:
+
+```zig
+chat.temperature = 0.7;
+chat.top_p = 0.9;
+chat.top_k = 40;           // Anthropic only
+chat.frequency_penalty = 0.5; // OpenAI only
+chat.presence_penalty = 0.3;  // OpenAI only
+chat.max_tokens = 8192;
+```
 
 ## Installation
 
@@ -202,7 +245,7 @@ zig build run-openai_chat   # OpenAI / OpenAI-compatible chat
 
 ### The Provider Interface
 
-The core of the library is `Provider` -- a VTable interface, the same pattern Zig's standard library uses for `std.mem.Allocator`, `std.io.Reader`, and friends. A fat pointer: `ptr: *anyopaque` + `vtable: *const VTable`.
+The core of the library is `Provider` -- a VTable interface, the same pattern Zig's standard library uses for `std.mem.Allocator` and friends. A fat pointer: `ptr: *anyopaque` + `vtable: *const VTable`.
 
 ```zig
 const Provider = struct {
@@ -236,7 +279,7 @@ No surprises here:
 ## Testing
 
 ```sh
-zig build test    # 46 tests, 0 leaks
+zig build test    # 74 tests, 0 leaks
 ```
 
 ## License

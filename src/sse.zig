@@ -69,32 +69,78 @@ pub fn nextEvent(data: []const u8, position: usize) ?SseEvent {
     return null;
 }
 
-/// Incremental SSE parser that reads from a live stream (std.io.AnyReader).
+/// Incremental SSE parser that reads from a live stream (*std.Io.Reader).
 /// Reads one line at a time and assembles complete SSE events.
 /// The returned SseEvent data is valid until the next call to nextEvent().
 pub const SseLineReader = struct {
-    underlying: std.io.AnyReader,
-    line_buf: [8192]u8,
+    underlying: *std.Io.Reader,
+    allocator: Allocator,
+    line_buf: std.ArrayList(u8),
     event_type_buf: [128]u8,
     data_buf: std.ArrayList(u8),
     event_type_len: usize,
     has_event_type: bool,
     has_data: bool,
+    eof: bool,
 
-    pub fn init(reader: std.io.AnyReader, allocator: Allocator) SseLineReader {
+    pub fn init(reader: *std.Io.Reader, allocator: Allocator) SseLineReader {
         return .{
             .underlying = reader,
-            .line_buf = undefined,
+            .allocator = allocator,
+            .line_buf = .{},
             .event_type_buf = undefined,
-            .data_buf = std.ArrayList(u8).init(allocator),
+            .data_buf = .{},
             .event_type_len = 0,
             .has_event_type = false,
             .has_data = false,
+            .eof = false,
         };
     }
 
     pub fn deinit(self: *SseLineReader) void {
-        self.data_buf.deinit();
+        self.data_buf.deinit(self.allocator);
+        self.line_buf.deinit(self.allocator);
+    }
+
+    /// Read a line from the underlying reader (up to and consuming '\n').
+    /// Returns the line content without the trailing '\n' (and strips '\r' if present).
+    /// Returns null on EOF.
+    fn readLine(self: *SseLineReader) ProviderError!?[]const u8 {
+        if (self.eof) return null;
+
+        self.line_buf.clearRetainingCapacity();
+
+        while (true) {
+            // Try to get buffered data
+            const buffered = self.underlying.buffered();
+            if (buffered.len > 0) {
+                // Scan for newline in buffered data
+                if (std.mem.indexOfScalar(u8, buffered, '\n')) |nl_pos| {
+                    // Found newline — append everything up to it
+                    self.line_buf.appendSlice(self.allocator, buffered[0..nl_pos]) catch return error.OutOfMemory;
+                    self.underlying.toss(nl_pos + 1); // consume including '\n'
+
+                    // Strip trailing \r
+                    const line = self.line_buf.items;
+                    const len = if (line.len > 0 and line[line.len - 1] == '\r') line.len - 1 else line.len;
+                    return line[0..len];
+                } else {
+                    // No newline yet — consume all buffered data and refill
+                    self.line_buf.appendSlice(self.allocator, buffered) catch return error.OutOfMemory;
+                    self.underlying.toss(buffered.len);
+                }
+            }
+
+            // Try to fill the buffer with more data from the stream
+            self.underlying.fillMore() catch {
+                // EndOfStream or read error — treat as EOF
+                self.eof = true;
+                if (self.line_buf.items.len > 0) {
+                    return self.line_buf.items;
+                }
+                return null;
+            };
+        }
     }
 
     /// Read and return the next complete SSE event from the stream.
@@ -102,23 +148,13 @@ pub const SseLineReader = struct {
     /// data slice is valid until the next call to nextEvent().
     pub fn nextEvent(self: *SseLineReader) ProviderError!?SseEvent {
         while (true) {
-            // Read one line (up to \n delimiter)
-            const line_with_newline = self.underlying.readUntilDelimiterOrEof(&self.line_buf, '\n') catch
-                return error.StreamInterrupted;
-
-            const raw_line = line_with_newline orelse {
+            const line = (try self.readLine()) orelse {
                 // EOF — if we have accumulated data, return it as a final event
                 if (self.has_data) {
                     return self.emitEvent();
                 }
                 return null;
             };
-
-            // Strip trailing \r for \r\n line endings
-            const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
-                raw_line[0 .. raw_line.len - 1]
-            else
-                raw_line;
 
             // Empty line = event boundary
             if (line.len == 0) {
@@ -145,9 +181,9 @@ pub const SseLineReader = struct {
                 const value = line[value_start..];
                 // If we already have data, join with newline (SSE spec)
                 if (self.data_buf.items.len > 0) {
-                    self.data_buf.append('\n') catch return error.OutOfMemory;
+                    self.data_buf.append(self.allocator, '\n') catch return error.OutOfMemory;
                 }
-                self.data_buf.appendSlice(value) catch return error.OutOfMemory;
+                self.data_buf.appendSlice(self.allocator, value) catch return error.OutOfMemory;
                 self.has_data = true;
             }
         }
@@ -217,8 +253,8 @@ test "incomplete event returns null" {
 
 test "SseLineReader: single event" {
     const input = "event: message_start\ndata: {\"type\":\"message\"}\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
@@ -231,8 +267,8 @@ test "SseLineReader: single event" {
 
 test "SseLineReader: multiple events" {
     const input = "event: a\ndata: first\n\nevent: b\ndata: second\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const e1 = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
@@ -248,8 +284,8 @@ test "SseLineReader: multiple events" {
 
 test "SseLineReader: skip comments" {
     const input = ": comment\nevent: ping\ndata: hello\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
@@ -259,8 +295,8 @@ test "SseLineReader: skip comments" {
 
 test "SseLineReader: event without type" {
     const input = "data: no-type\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
@@ -270,8 +306,8 @@ test "SseLineReader: event without type" {
 
 test "SseLineReader: multiple data lines joined with newline" {
     const input = "event: content\ndata: line1\ndata: line2\ndata: line3\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;
@@ -281,8 +317,8 @@ test "SseLineReader: multiple data lines joined with newline" {
 
 test "SseLineReader: handles \\r\\n line endings" {
     const input = "event: test\r\ndata: hello\r\n\r\n";
-    var stream = std.io.fixedBufferStream(input);
-    var reader = SseLineReader.init(stream.reader().any(), std.testing.allocator);
+    var fixed_reader = std.Io.Reader.fixed(input);
+    var reader = SseLineReader.init(&fixed_reader, std.testing.allocator);
     defer reader.deinit();
 
     const event = (try reader.nextEvent()) orelse return error.TestUnexpectedResult;

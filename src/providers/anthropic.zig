@@ -128,9 +128,9 @@ fn doPost(self: *Anthropic, body: []const u8, allocator: Allocator) ProviderErro
 // --- Request building ---
 
 fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, allocator: Allocator) ![]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
-    var jw = jh.jsonWriter(buf.writer());
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var jw = jh.jsonWriter(buf.writer(allocator));
 
     try jw.beginObject();
 
@@ -201,7 +201,7 @@ fn buildRequestBody(request: Provider.CompletionRequest, do_stream: bool, alloca
 
     try jw.endObject();
 
-    return buf.toOwnedSlice();
+    return buf.toOwnedSlice(allocator);
 }
 
 fn writeMessage(jw: anytype, msg: types.Message) !void {
@@ -329,15 +329,15 @@ fn parseCompletionFromParsedJson(root: std.json.Value, allocator: Allocator) Pro
     const content_val = jh.getPath(root, "content") orelse return error.InvalidResponse;
     const content_arr = jh.getJsonArray(content_val) orelse return error.InvalidResponse;
 
-    var content_blocks = std.ArrayList(types.ContentBlock).init(allocator);
-    defer content_blocks.deinit();
+    var content_blocks: std.ArrayList(types.ContentBlock) = .{};
+    defer content_blocks.deinit(allocator);
 
     for (content_arr.items) |item| {
         const block = parseContentBlock(item, allocator) catch continue;
-        content_blocks.append(block) catch return error.OutOfMemory;
+        content_blocks.append(allocator, block) catch return error.OutOfMemory;
     }
 
-    const content = content_blocks.toOwnedSlice() catch return error.OutOfMemory;
+    const content = content_blocks.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
     return .{
         .message = .{
@@ -413,19 +413,15 @@ fn mapApiErrorFromJson(self: *Anthropic, root: std.json.Value) ?ProviderError {
 
     self.storeErrorDetails(err_type, err_message);
 
-    if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
-    if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
-    if (std.mem.eql(u8, err_type, "invalid_request_error")) return error.InvalidRequest;
-    if (std.mem.eql(u8, err_type, "overloaded_error")) return error.Overloaded;
-    if (std.mem.eql(u8, err_type, "not_found_error")) return error.ModelNotFound;
-    if (std.mem.eql(u8, err_type, "permission_error")) return error.AuthenticationFailed;
-
-    return error.ProviderError;
+    return classifyErrorType(err_type);
 }
 
 fn classifyApiError(root: std.json.Value) ?ProviderError {
     const err_type = jh.getJsonString(jh.getPath(root, "error.type") orelse return null) orelse return null;
+    return classifyErrorType(err_type);
+}
 
+fn classifyErrorType(err_type: []const u8) ProviderError {
     if (std.mem.eql(u8, err_type, "authentication_error")) return error.AuthenticationFailed;
     if (std.mem.eql(u8, err_type, "rate_limit_error")) return error.RateLimited;
     if (std.mem.eql(u8, err_type, "invalid_request_error")) return error.InvalidRequest;
