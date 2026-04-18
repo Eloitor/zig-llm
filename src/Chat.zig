@@ -373,6 +373,20 @@ pub fn appendAssistantMessage(self: *Chat, message: types.Message) ProviderError
     self.history.append(self.allocator, cloned) catch return error.OutOfMemory;
 }
 
+/// Append a tool result to history without triggering a completion.
+/// Useful when driving the tool-use loop manually (e.g. while streaming).
+pub fn addToolResult(self: *Chat, tool_use_id: []const u8, content: []const u8, is_error: bool) ProviderError!void {
+    return self.appendToolResult(tool_use_id, content, is_error);
+}
+
+/// Re-stream from the current history without appending a new user message.
+/// Use after `addToolResult` to continue a tool-use loop with streaming.
+pub fn streamContinue(self: *Chat) ProviderError!StreamResponse {
+    const request = self.buildRequest();
+    const iterator = try self.streamWithRetry(request);
+    return StreamResponse.init(self, iterator, self.allocator);
+}
+
 /// Clear conversation history.
 pub fn clearHistory(self: *Chat) void {
     for (self.history.items) |msg| {
