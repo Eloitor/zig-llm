@@ -29,6 +29,7 @@ pub const HttpStream = struct {
     redirect_buf: []u8,
     transfer_buf: []u8,
     cached_response: std.http.Client.Response,
+    aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Returns a reader for incrementally reading the response body.
     pub fn reader(self: *HttpStream) *std.Io.Reader {
@@ -40,6 +41,15 @@ pub const HttpStream = struct {
             head.transfer_encoding,
             head.content_length,
         );
+    }
+
+    /// Thread-safe: shuts down the underlying socket so any blocked read()
+    /// returns immediately. Safe to call from a thread other than the reader.
+    pub fn abort(self: *HttpStream) void {
+        if (self.aborted.swap(true, .acq_rel)) return;
+        const conn = self.request.connection orelse return;
+        const stream = conn.stream_reader.getStream();
+        std.posix.shutdown(stream.handle, .both) catch {};
     }
 
     pub fn deinit(self: *HttpStream) void {
@@ -137,6 +147,7 @@ pub fn openStream(
         .redirect_buf = redirect_buf,
         .transfer_buf = transfer_buf,
         .cached_response = resp,
+        .aborted = std.atomic.Value(bool).init(false),
     };
 
     return stream;

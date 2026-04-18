@@ -108,6 +108,7 @@ pub const StreamIterator = struct {
     pub const StreamVTable = struct {
         next: *const fn (ptr: *anyopaque) ProviderError!?types.StreamEvent,
         deinit: *const fn (ptr: *anyopaque) void,
+        abort: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn initFrom(pointer: anytype) StreamIterator {
@@ -124,6 +125,10 @@ pub const StreamIterator = struct {
                 const self: *Impl = @ptrCast(@alignCast(p));
                 self.deinit();
             }
+            fn abortImpl(p: *anyopaque) void {
+                const self: *Impl = @ptrCast(@alignCast(p));
+                if (@hasDecl(Impl, "abort")) self.abort();
+            }
         };
 
         return .{
@@ -131,6 +136,7 @@ pub const StreamIterator = struct {
             .vtable = &.{
                 .next = gen.nextImpl,
                 .deinit = gen.deinitImpl,
+                .abort = gen.abortImpl,
             },
         };
     }
@@ -141,6 +147,12 @@ pub const StreamIterator = struct {
 
     pub fn deinit(self: *StreamIterator) void {
         self.vtable.deinit(self.ptr);
+    }
+
+    /// Thread-safe: requests the underlying transport to abort. Any in-flight
+    /// call to `next()` on another thread will return an error or null soon.
+    pub fn abort(self: *StreamIterator) void {
+        self.vtable.abort(self.ptr);
     }
 };
 

@@ -202,6 +202,12 @@ pub const StreamResponse = struct {
         }) catch return;
     }
 
+    /// Thread-safe: forwards to the underlying iterator's transport-level abort.
+    /// A concurrent `next()` call will return shortly with an error or null.
+    pub fn abort(self: *StreamResponse) void {
+        self.iterator.abort();
+    }
+
     pub fn deinit(self: *StreamResponse) void {
         // If stream wasn't fully consumed, still try to finalize
         if (!self.finished) {

@@ -764,6 +764,10 @@ const StreamContext = struct {
         return null;
     }
 
+    pub fn abort(self: *StreamContext) void {
+        self.http_stream.abort();
+    }
+
     pub fn deinit(self: *StreamContext) void {
         if (self.pending_event) |evt| {
             var e = evt;
